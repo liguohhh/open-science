@@ -17,6 +17,7 @@ export const SEND_ATTEMPT_PHASES = [
   'acp-authenticate',
   'acp-provider-configuration',
   'acp-resume',
+  'checkpoint-lock',
   'adopt-replacement',
   'acp-session-new',
   'acp-timeout-cleanup',
@@ -68,6 +69,7 @@ export type SendAttemptEvent = SendAttemptScope & {
   result: SendAttemptResult
   mode?: SendAttemptMode
   detail?: SendAttemptDetail
+  operationId?: string
   durationMs?: number
   timeoutMs?: number
 }
@@ -100,6 +102,7 @@ export const readSendAttemptEvent = (value: unknown): SendAttemptEvent | undefin
           'result',
           'mode',
           'detail',
+          'operationId',
           'durationMs',
           'timeoutMs'
         ].includes(key)
@@ -109,6 +112,7 @@ export const readSendAttemptEvent = (value: unknown): SendAttemptEvent | undefin
   if (
     (event.projectId !== undefined && !isSendDiagnosticId(event.projectId)) ||
     (event.sessionId !== undefined && !isSendDiagnosticId(event.sessionId)) ||
+    (event.operationId !== undefined && !isSendDiagnosticId(event.operationId)) ||
     !SEND_ATTEMPT_PHASES.includes(event.phase) ||
     !['started', 'completed', 'failed', 'timed-out', 'cancelled', 'late-result'].includes(
       event.result

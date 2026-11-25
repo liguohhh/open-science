@@ -9,7 +9,9 @@ import {
 } from '../../shared/send-attempt-diagnostics'
 import { assertTaskRunTracingReady, requiresTaskRunTracing } from './task-run-tracing'
 import { freshSessionAttachment } from './session-agent-target'
-import { HARNESS_OWNER } from '../harness-acp/config'
+import { HARNESS_CHECKPOINT_LOCK_META, HARNESS_OWNER } from '../harness-acp/config'
+import { DEFAULT_AGENT_FRAMEWORK_ID } from '../../shared/agent-framework-id'
+import { traceCheckpointLock } from './checkpoint-lock-diagnostics'
 import type { AcpSpecialistResolutionContext } from './runtime-contract'
 import {
   recordMainAgentContext,
@@ -934,27 +936,30 @@ export class AcpProviderSessionResumer {
 
       let resumeResponse: unknown
       try {
+        const builtIn = backend.framework.id === DEFAULT_AGENT_FRAMEWORK_ID
+        const resume = (operationId?: string): Promise<unknown> =>
+          connection.agent.request(
+            acp.methods.agent.session.resume,
+            {
+              sessionId: providerSessionId,
+              cwd,
+              mcpServers: sessionCapabilities.mcpServers,
+              ...specialistProjection.setup.metaArg,
+              ...(builtIn
+                ? {
+                    _meta: {
+                      ...specialistProjection.setup.metaArg._meta,
+                      [HARNESS_OWNER]: { projectId, sessionId: request.sessionId },
+                      ...(operationId ? { [HARNESS_CHECKPOINT_LOCK_META]: operationId } : {})
+                    }
+                  }
+                : {})
+            },
+            { cancellationSignal }
+          )
         resumeResponse = await traceMainSendWait(
           'acp-resume',
-          () =>
-            connection.agent.request(
-              acp.methods.agent.session.resume,
-              {
-                sessionId: providerSessionId,
-                cwd,
-                mcpServers: sessionCapabilities.mcpServers,
-                ...specialistProjection.setup.metaArg,
-                ...(backend.framework.id === 'open-science-agent'
-                  ? {
-                      _meta: {
-                        ...specialistProjection.setup.metaArg._meta,
-                        [HARNESS_OWNER]: { projectId, sessionId: request.sessionId }
-                      }
-                    }
-                  : {})
-              },
-              { cancellationSignal }
-            ),
+          () => (builtIn ? traceCheckpointLock(connection, resume) : resume()),
           { detail: 'session/resume' }
         )
       } catch (error) {
