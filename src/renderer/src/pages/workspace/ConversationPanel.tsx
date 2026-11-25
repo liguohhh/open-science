@@ -1984,7 +1984,8 @@ const ConversationPanel = ({
           </button>
         </header>
 
-        {isNewConversation ? null : activeSession?.contentLoaded === false &&
+        {isNewConversation ? null : !optimisticMessage &&
+          activeSession?.contentLoaded === false &&
           !activeSession.historyPage ? (
           sessionLoadError ? (
             <div className="flex min-h-0 flex-1 items-center justify-center p-6">

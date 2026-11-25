@@ -48,6 +48,7 @@ import {
 } from './workspace-send-attempt'
 import { i18next } from '../../i18n'
 import { validateImageAnnotationSourcesBeforeSend } from '../../pages/workspace/annotations/image-annotation-source-validation'
+import type { ComposerSendSnapshot } from '../../pages/workspace/composer-contract'
 import { toPersistedSession, useSessionStore } from '../../stores/session-store'
 import { isSessionDeletionAllowed } from '../../stores/session-actionability'
 import type { ChatMessage } from '../../stores/session-store-contract'
@@ -107,7 +108,10 @@ type SendWorkspaceMessageIntent = {
   // Optional durable caller identity for restart-safe application-owned prompts.
   messageId?: string
   retryStorageTimeout?: boolean
-  // Renderer-only notification: the real message now replaces the composer's pending preview.
+  composerSnapshot?: ComposerSendSnapshot
+  onPreparationStarted?: () => void
+  onMessagePersisted?: () => void
+  // Renderer-only notification: the message has entered the local conversation projection.
   onMessageAppended?: (message: SendWorkspaceMessageResult) => void
   // Main has admitted this prompt; optimistic append alone does not establish ownership.
   onPromptAccepted?: () => void
@@ -283,9 +287,12 @@ const rejectPreparedPrompt = async (
       preparation?.promptMessageId ?? timeout?.wait.promptMessageId
     ) ?? (timeout ? attempt?.attachments : undefined)
   // Start compensation before removing optimistic intents; keep the exact write protected.
-  const cleanup = preparation ? attemptWorkspacePromptRollback(preparation) : undefined
+  const preserveSubmittedMessage = attempt?.composerMessageCommitted === true
+  const cleanup = preparation
+    ? attemptWorkspacePromptRollback(preparation, preserveSubmittedMessage)
+    : undefined
   if (attempt) attempt.rollback = cleanup
-  if (preparation) withdrawWorkspacePrompt(preparation)
+  if (preparation && !preserveSubmittedMessage) withdrawWorkspacePrompt(preparation)
   markPendingSessionRetryable(sessionId)
   reportWorkspaceOperationError(sessionId, message, {
     providerTarget,
@@ -1107,6 +1114,7 @@ const startPendingPrompt = (
       if (attempt) attempt.preparation = undefined
       return undefined
     }
+    releaseWorkspaceSendPreview(attempt)
     try {
       const admission = dispatchPrompt(runtime, {
         trace: attempt?.trace,
@@ -1882,6 +1890,7 @@ const performSendWorkspaceMessage = async (
       if (!ownsPrompt(sessionId, appended.messageId)) return undefined
     }
     if (attempt?.cancelled) return undefined
+    releaseWorkspaceSendPreview(attempt)
     const promptMedia =
       input.truncateFromMessageId && promptAttachments.length > 0
         ? partitionWorkspacePromptAttachments({
@@ -2010,6 +2019,10 @@ const performSendWorkspaceMessage = async (
 
 type WorkspaceSendAttempt = {
   submissionMessageId: string
+  preview?: WorkspaceSendPreview
+  previewSessionId?: string
+  onMessagePersisted?: () => void
+  composerMessageCommitted?: boolean
   trace: WorkspaceSendAttemptTrace
   selectionChanged: boolean
   cancellationEligible: boolean
@@ -2035,6 +2048,13 @@ type WorkspaceSendAttempt = {
   stop: () => void
 }
 
+type WorkspaceSendPreview = {
+  projectId: string | undefined
+  messageId: string
+  snapshot: ComposerSendSnapshot
+  text: string
+  parts: MessagePart[] | undefined
+}
 const retainExpiredStorageWait = <Result>(
   attempt: WorkspaceSendAttempt,
   timeout: WorkspaceSendStorageTimeout,
@@ -2073,10 +2093,60 @@ const retainExpiredStorageWait = <Result>(
     })
 }
 const preparingSessionAttempts = new Map<string, WorkspaceSendAttempt>()
+const sendPreviewListeners = new Map<string, Set<() => void>>()
+
+const notifyWorkspaceSendPreview = (sessionId: string): void => {
+  for (const listener of sendPreviewListeners.get(sessionId) ?? []) listener()
+}
+
+export const readWorkspaceSendPreview = (
+  projectId: string,
+  sessionId: string
+): WorkspaceSendPreview | undefined => {
+  const attempt = preparingSessionAttempts.get(sessionId)
+  return attempt?.previewSessionId === sessionId && attempt.preview?.projectId === projectId
+    ? attempt.preview
+    : undefined
+}
+
+export const subscribeWorkspaceSendPreview = (
+  sessionId: string,
+  listener: () => void
+): (() => void) => {
+  let listeners = sendPreviewListeners.get(sessionId)
+  if (!listeners) sendPreviewListeners.set(sessionId, (listeners = new Set()))
+  listeners.add(listener)
+  return () => {
+    listeners.delete(listener)
+    if (listeners.size === 0) sendPreviewListeners.delete(sessionId)
+  }
+}
+
+/** 保存回执确认后清掉草稿引用，即使原会话已卸载。 */
+const releaseWorkspaceSendPreview = (attempt: WorkspaceSendAttempt, persisted = true): void => {
+  const notifyPersisted = attempt.onMessagePersisted
+  if (persisted && notifyPersisted && attempt.preview) attempt.composerMessageCommitted = true
+  attempt.onMessagePersisted = undefined
+  attempt.preview = undefined
+  if (attempt.previewSessionId) {
+    const id = attempt.previewSessionId
+    attempt.previewSessionId = undefined
+    if (preparingSessionAttempts.get(id) === attempt) notifyWorkspaceSendPreview(id)
+  }
+  if (persisted) notifyPersisted?.()
+}
+
 const trackWorkspaceSendPreparation = (attempt: WorkspaceSendAttempt, sessionId: string): void => {
   if (attempt.sessionIds.has(sessionId)) return
   attempt.sessionIds.add(sessionId)
+  const previousOwner = preparingSessionAttempts.get(sessionId)
   preparingSessionAttempts.set(sessionId, attempt)
+  if (attempt.preview) {
+    const previous = attempt.previewSessionId
+    attempt.previewSessionId = sessionId
+    if (previous) notifyWorkspaceSendPreview(previous)
+    notifyWorkspaceSendPreview(sessionId)
+  } else if (previousOwner?.previewSessionId === sessionId) notifyWorkspaceSendPreview(sessionId)
   if (!attempt.cancelled && !attempt.failed && !attempt.dispatched)
     attempt.notifyPreparation?.(sessionId, true)
 }
@@ -2102,13 +2172,19 @@ const cancelPreparingWorkspacePrompt = (sessionId: string): boolean => {
   else if (attempt.message) withdrawUnboundPendingPrompt(attempt.message)
   markPendingSessionRetryable(attempt.message?.sessionId ?? sessionId)
   attempt.restore?.(attempt.message?.sessionId ?? sessionId, attachments)
+  releaseWorkspaceSendPreview(attempt, false)
   attempt.stop()
   return true
 }
 
 const sendWorkspaceMessage = async (
   runtime: WorkspaceCommandRuntime,
-  input: SendWorkspaceMessageCommand,
+  {
+    composerSnapshot,
+    onPreparationStarted,
+    onMessagePersisted,
+    ...input
+  }: SendWorkspaceMessageCommand,
   lifecycle: WorkspaceCommandLifecycle = {}
 ): Promise<SendWorkspaceMessageResult | undefined> => {
   const sessionId = input.sessionId
@@ -2176,6 +2252,18 @@ const sendWorkspaceMessage = async (
   const finishSend = trace.start('send')
   const attempt: WorkspaceSendAttempt = {
     submissionMessageId,
+    ...(composerSnapshot
+      ? {
+          preview: {
+            projectId: input.projectId ?? previousSession?.projectId,
+            messageId: submissionMessageId,
+            snapshot: composerSnapshot,
+            text: input.text,
+            parts: input.parts
+          }
+        }
+      : {}),
+    onMessagePersisted,
     trace,
     selectionChanged: false,
     cancellationEligible:
@@ -2208,11 +2296,16 @@ const sendWorkspaceMessage = async (
     stop
   }
   if (sessionId) trackWorkspaceSendPreparation(attempt, sessionId)
+  onPreparationStarted?.()
   const unsubscribeSelection = useSessionStore.subscribe((state, previous) => {
     if (state.selectedSessionId !== previous.selectedSessionId) attempt.selectionChanged = true
     // Late authoritative saves may still contain the unsent optimistic run. Keep only this
     // receipt withdrawn until its old writes and conditional rollback have finished.
-    if ((attempt.failed || (attempt.cancelled && !attempt.dispatched)) && attempt.preparation)
+    if (
+      !attempt.composerMessageCommitted &&
+      (attempt.failed || (attempt.cancelled && !attempt.dispatched)) &&
+      attempt.preparation
+    )
       if (ownsWorkspacePromptPreparation(attempt.preparation))
         withdrawWorkspacePrompt(attempt.preparation)
   })
@@ -2234,6 +2327,7 @@ const sendWorkspaceMessage = async (
         attempt.endPresentation()
         if (retryMessageId) input.onPreparationRejected?.(error, id, attachments, retryMessageId)
         else input.onPreparationRejected?.(error, id, attachments)
+        releaseWorkspaceSendPreview(attempt, false)
         trace.record({ phase: 'composer-feedback', result: 'completed', detail: 'error-reported' })
       }
     },
@@ -2248,6 +2342,7 @@ const sendWorkspaceMessage = async (
   const finish = async (result?: SendWorkspaceMessageResult, error?: unknown): Promise<void> => {
     try {
       if (attempt.pendingPreparation) result = await attempt.pendingPreparation
+      releaseWorkspaceSendPreview(attempt, false)
       if (attempt.lateStorage) await attempt.lateStorage
       if (attempt.promptAdmission && !(await attempt.promptAdmission)) result = undefined
       if (attempt.rollback) await attempt.rollback
@@ -2271,6 +2366,7 @@ const sendWorkspaceMessage = async (
       )
       unsubscribeSelection()
       trace.release()
+      releaseWorkspaceSendPreview(attempt, false)
       attempt.endPresentation()
       for (const id of attempt.sessionIds)
         if (preparingSessionAttempts.get(id) === attempt) {
@@ -2300,7 +2396,10 @@ const deleteWorkspaceSession = async (
   if (!isSessionDeletionAllowed(source))
     return { status: 'failed', reason: 'runtime', runtimeDetached: false }
   const attempt = preparingSessionAttempts.get(source.id)
-  if (attempt && !attempt.dispatched) attempt.cancelled = true
+  if (attempt && !attempt.dispatched) {
+    attempt.cancelled = true
+    releaseWorkspaceSendPreview(attempt, false)
+  }
   consumePendingSessionRetry(source.id)
   const boundId = source.isPending ? source.pendingBindingSessionId : source.id
   if (!boundId) {

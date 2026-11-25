@@ -409,7 +409,7 @@ const useWorkspaceComposerController = ({
   )
   const retryMessage = t('Upload interrupted or unavailable. Remove it and select the file again.')
   const projectIdRef = useRef(activeProjectId ?? 'default-project')
-  const { draftsRef, versionsRef, deletedDraftKeysRef, restoreFailedSendRef } =
+  const { draftsRef, versionsRef, deletedDraftKeysRef, clearDraftRef, restoreFailedSendRef } =
     useWorkspaceComposerDrafts()
   // Read the parked memory snapshot once at mount; subsequent edits use live controller state.
   const [initialDraft] = useState(
@@ -1661,7 +1661,7 @@ const useWorkspaceComposerController = ({
     },
     [setAdmissionProjectionState]
   )
-  const clearDraft = useCallback(
+  const clearDraftHere = useCallback(
     (draftKey: string, expectedVersion?: number): boolean => {
       const currentVersion = versionsRef.current[draftKey] ?? 0
       if (expectedVersion !== undefined && currentVersion !== expectedVersion) return false
@@ -1700,6 +1700,16 @@ const useWorkspaceComposerController = ({
       setActiveSetupSessionToken,
       setError
     ]
+  )
+  useLayoutEffect(() => {
+    clearDraftRef.current = clearDraftHere
+    return () => {
+      if (clearDraftRef.current === clearDraftHere) clearDraftRef.current = undefined
+    }
+  }, [clearDraftRef, clearDraftHere])
+  const clearDraft = useCallback<WorkspaceComposerController['lifecycle']['clearDraft']>(
+    (...args) => (clearDraftRef.current ?? clearDraftHere)(...args),
+    [clearDraftRef, clearDraftHere]
   )
   const reportNewerDraftKept = useCallback(
     (snapshot: ComposerSendSnapshot): void => {

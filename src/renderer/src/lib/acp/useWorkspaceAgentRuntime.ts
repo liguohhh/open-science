@@ -348,8 +348,9 @@ const useOwnedWorkspaceAgentRuntime = (
         })
       }
       rememberAdmittedTarget(resolvedInput.sessionId)
-      const pendingPdfContextSelection = resolvedInput.projectId
-        ? usePreviewWorkbenchStore.getState().pendingPdfContextByProject[resolvedInput.projectId]
+      const projectId = resolvedInput.projectId
+      const pendingPdfContextSelection = projectId
+        ? usePreviewWorkbenchStore.getState().pendingPdfContextByProject[projectId]
         : undefined
       return sendWorkspaceMessage(
         runtime,
@@ -370,13 +371,9 @@ const useOwnedWorkspaceAgentRuntime = (
             rememberAdmittedTarget(sessionId)
           },
           onPdfContextLinked: (_sessionId, pdfContext) => {
-            if (!resolvedInput.projectId) return
-            revealLinkedPdfContext(resolvedInput.projectId, pdfContext)
-            clearLinkedPendingPdfContext(
-              resolvedInput.projectId,
-              pendingPdfContextSelection,
-              pdfContext
-            )
+            if (!projectId) return
+            revealLinkedPdfContext(projectId, pdfContext)
+            clearLinkedPendingPdfContext(projectId, pendingPdfContextSelection, pdfContext)
           },
           onSessionSizeLimit
         }

@@ -1,6 +1,19 @@
 import { reportWorkspaceOperationError } from '@/lib/acp/workspace-operation-error'
 import { i18next } from '@/i18n'
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore
+} from 'react'
+import {
+  readWorkspaceSendPreview,
+  subscribeWorkspaceSendPreview
+} from '@/lib/acp/workspace-runtime-command-owner'
+import type { ComposerSendSnapshot } from './composer-contract'
 
 import type { WorkspaceAgentRuntime } from '@/lib/acp/useWorkspaceAgentRuntime'
 import {
@@ -435,7 +448,34 @@ const useWorkspaceConversationController = (
         reportWorkspaceOperationError(activeSessionId, errorMessage(error))
       )
   }, [activeSessionId, cancelInFlightRun, promptInFlightSessionIds, runtime])
-  const [optimisticMessages, setOptimisticMessages] = useState<Record<string, ChatMessage>>({})
+  const activeProjectId = activeSession?.projectId
+  const subscribePreview = useCallback(
+    (listener: () => void) =>
+      activeSessionId ? subscribeWorkspaceSendPreview(activeSessionId, listener) : () => {},
+    [activeSessionId]
+  )
+  const preview = useSyncExternalStore(subscribePreview, () =>
+    activeSessionId && activeProjectId
+      ? readWorkspaceSendPreview(activeProjectId, activeSessionId)
+      : undefined
+  )
+  const optimisticMessage = useMemo<ChatMessage | undefined>(
+    () =>
+      preview && {
+        id: preview.messageId,
+        role: 'user',
+        content: preview.text,
+        status: 'complete',
+        eventIds: [],
+        uploads: preview.snapshot.attachments,
+        annotations: preview.snapshot.annotations,
+        parts: preview.parts,
+        pdfContext: preview.snapshot.pdfContext,
+        createdAt: 0,
+        updatedAt: 0
+      },
+    [preview]
+  )
   const planProjectionRecoveryError = usePlanProjectionRecovery(
     options.activeSession,
     options.planProjectionRecovery
@@ -534,7 +574,8 @@ const useWorkspaceConversationController = (
         return
       }
 
-      const snapshot = composer.lifecycle.captureSend(!branchInNewSession)
+      let snapshot: ComposerSendSnapshot | undefined =
+        composer.lifecycle.captureSend(!branchInNewSession)
       const retryOwner = snapshot.retrySessionOwner
         ? current.getSession(snapshot.retrySessionOwner.sessionId)
         : undefined
@@ -580,6 +621,9 @@ const useWorkspaceConversationController = (
         session.lifecycle.captureSendIntent(branchInNewSession)
 
       const dispatch = (sessionId: string | undefined): void => {
+        const submitted = snapshot
+        if (!submitted) return
+        let preparationStarted = false
         // Only Main admission consumes optimizer undo; optimistic append and preparation can fail.
         let accepted = false
         const acceptDraft = (): void => {
@@ -590,36 +634,9 @@ const useWorkspaceConversationController = (
         let preparationRejected = false
         let proseReadingConsumed = false
         const consumePdfProseReading = (): void => {
-          if (proseReadingConsumed || preparationRejected) return
+          if (!snapshot || proseReadingConsumed || preparationRejected) return
           proseReadingConsumed = true
           optionsRef.current.composer.lifecycle.consumePdfProseReading(snapshot)
-        }
-        const optimisticMessage = sessionId
-          ? {
-              id: `optimistic-${snapshot.draftKey}-${snapshot.version}`,
-              role: 'user' as const,
-              content: docToText(snapshot.doc),
-              status: 'complete' as const,
-              eventIds: [],
-              uploads: snapshot.attachments,
-              annotations: snapshot.annotations,
-              parts: docToMessageParts(snapshot.doc),
-              pdfContext: snapshot.pdfContext,
-              createdAt: 0,
-              updatedAt: 0
-            }
-          : undefined
-        const clearOptimisticMessage = (): void => {
-          if (!sessionId || !optimisticMessage) return
-          setOptimisticMessages((current) => {
-            if (current[sessionId] !== optimisticMessage) return current
-            const next = { ...current }
-            delete next[sessionId]
-            return next
-          })
-        }
-        if (sessionId && optimisticMessage) {
-          setOptimisticMessages((current) => ({ ...current, [sessionId]: optimisticMessage }))
         }
         const restorePreparation = (
           rejectedSessionId?: string,
@@ -628,7 +645,7 @@ const useWorkspaceConversationController = (
           retryMessageId?: string
         ): void => {
           preparationRejected = true
-          clearOptimisticMessage()
+          if (!snapshot || !preparationStarted) return
           // Rejection is asynchronous: act on the composer as it is now, not as it was at submit.
           const latest = optionsRef.current
           const targetDraftKey =
@@ -650,31 +667,48 @@ const useWorkspaceConversationController = (
             finalizedAttachments?.map((attachment) => [attachment.id, attachment])
           )
           latest.composer.lifecycle.restoreFailedSend(
-            {
-              ...snapshot,
-              retrySessionOwner,
-              // Native setup authority has already been bound to the retry Session.
-              ...(retrySessionOwner ? { setupSessionToken: undefined } : {}),
-              attachments: snapshot.attachments.map(
-                (attachment) => byId.get(attachment.id) ?? attachment
-              )
-            },
+            retrySessionOwner === snapshot.retrySessionOwner && !finalizedAttachments?.length
+              ? snapshot
+              : {
+                  ...snapshot,
+                  retrySessionOwner,
+                  ...(retrySessionOwner ? { setupSessionToken: undefined } : {}),
+                  attachments: finalizedAttachments?.length
+                    ? snapshot.attachments.map(
+                        (attachment) => byId.get(attachment.id) ?? attachment
+                      )
+                    : snapshot.attachments
+                },
             true,
             wasNewConversation || branchInNewSession ? rejectedSessionId : undefined,
             true
           )
+          snapshot = undefined
         }
+        if (wasNewConversation && !branchInNewSession && !retryOwner)
+          composer.lifecycle.preserveAdmissionContext(submitted)
         void runtime
           .sendMessage({
             sessionId,
-            ...(snapshot.retrySessionOwner?.messageId
-              ? { messageId: snapshot.retrySessionOwner.messageId, retryStorageTimeout: true }
+            composerSnapshot: submitted,
+            onPreparationStarted: () => {
+              preparationStarted = true
+              if (snapshot?.annotations.length === 0)
+                composer.lifecycle.clearDraft(snapshot.draftKey, snapshot.version)
+            },
+            onMessagePersisted: () => {
+              consumePdfProseReading()
+              if (snapshot?.annotations.length)
+                composer.lifecycle.clearDraft(snapshot.draftKey, snapshot.version)
+              snapshot = undefined
+            },
+            ...(submitted.retrySessionOwner?.messageId
+              ? { messageId: submitted.retrySessionOwner.messageId, retryStorageTimeout: true }
               : {}),
             onPromptAccepted: acceptDraft,
             onMessageAppended: (message) => {
               consumePdfProseReading()
-              clearOptimisticMessage()
-              if (wasNewConversation && !sessionId && !branchInNewSession) {
+              if (snapshot && wasNewConversation && !sessionId && !branchInNewSession) {
                 optionsRef.current.composer.lifecycle.bindAdmissionContext(snapshot, message)
                 current.onNewSessionAppended?.(message)
               }
@@ -691,17 +725,17 @@ const useWorkspaceConversationController = (
             ...(branchInNewSession && activeSession
               ? { branchSourceSessionId: activeSession.id }
               : {}),
-            text: docToText(snapshot.doc),
-            attachments: snapshot.attachments,
-            annotations: snapshot.annotations,
-            referencedArtifacts: docToArtifactRefs(snapshot.doc),
-            parts: docToMessageParts(snapshot.doc),
-            pdfContext: snapshot.pdfContext,
-            pdfReadingPosition: snapshot.pdfReadingPosition,
-            pdfReadingPositionSource: snapshot.pdfReadingPositionSource,
-            pdfProseReadingSelections: snapshot.pdfProseReadingSelections,
-            pendingPdfContextAttachmentIds: snapshot.pendingPdfContextAttachmentIds,
-            pendingPdfContextVersions: snapshot.pendingPdfContextVersions,
+            text: docToText(submitted.doc),
+            attachments: submitted.attachments,
+            annotations: submitted.annotations,
+            referencedArtifacts: docToArtifactRefs(submitted.doc),
+            parts: docToMessageParts(submitted.doc),
+            pdfContext: submitted.pdfContext,
+            pdfReadingPosition: submitted.pdfReadingPosition,
+            pdfReadingPositionSource: submitted.pdfReadingPositionSource,
+            pdfProseReadingSelections: submitted.pdfProseReadingSelections,
+            pendingPdfContextAttachmentIds: submitted.pendingPdfContextAttachmentIds,
+            pendingPdfContextVersions: submitted.pendingPdfContextVersions,
             cwd: activeSession?.cwd,
             projectId: activeSession?.projectId ?? current.projectId,
             permissionProfile: current.permissionProfile,
@@ -714,8 +748,8 @@ const useWorkspaceConversationController = (
               current.newConversationDelegationPolicyOverride
             ),
             forcedSkillIds,
-            ...(wasNewConversation && snapshot.setupSessionToken
-              ? { setupSessionToken: snapshot.setupSessionToken }
+            ...(wasNewConversation && submitted.setupSessionToken
+              ? { setupSessionToken: submitted.setupSessionToken }
               : {}),
             ...(mode === 'plan-first' ? { turnIntent: 'plan-first' as const } : {}),
             specialistId: draftSpecialistId,
@@ -732,11 +766,13 @@ const useWorkspaceConversationController = (
           })
           .then((result) => {
             if (!result) {
-              if (!preparationRejected) composer.lifecycle.restoreFailedSend(snapshot)
+              if (snapshot && preparationStarted && !preparationRejected)
+                composer.lifecycle.restoreFailedSend(snapshot)
+              snapshot = undefined
               return
             }
             consumePdfProseReading()
-            if (snapshot.annotations.length > 0) {
+            if (snapshot?.annotations.length) {
               composer.lifecycle.clearDraft(snapshot.draftKey, snapshot.version)
             }
             current.resetNewConversationSettings()
@@ -744,7 +780,6 @@ const useWorkspaceConversationController = (
           })
           .finally(() => {
             inFlightDraftKeysRef.current.delete(submissionKey)
-            clearOptimisticMessage()
           })
       }
 
@@ -756,15 +791,11 @@ const useWorkspaceConversationController = (
               inFlightDraftKeysRef.current.delete(submissionKey)
               return
             }
-            if (snapshot.annotations.length === 0) composer.lifecycle.clearDraft(activeSession.id)
             dispatch(activeSession.id)
           })
         return
       }
 
-      if (wasNewConversation && !branchInNewSession && !retryOwner)
-        composer.lifecycle.preserveAdmissionContext(snapshot)
-      if (snapshot.annotations.length === 0) composer.lifecycle.clearDraft(current.currentDraftKey)
       dispatch(branchInNewSession ? undefined : (retryOwner?.id ?? activeSession?.id))
     }
 
@@ -935,9 +966,7 @@ const useWorkspaceConversationController = (
       options.activeSession && options.promptInFlightSessionIds.includes(options.activeSession.id)
     ),
     admitApplicationMessage: messageQueue.lifecycle.enqueueApplication,
-    optimisticMessage: options.activeSession
-      ? optimisticMessages[options.activeSession.id]
-      : undefined,
+    optimisticMessage,
     planProjectionRecoveryError,
     availability: {
       submit: submitImmediately || queueDraft,

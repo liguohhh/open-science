@@ -13,6 +13,7 @@ type ComposerDraftOwner = {
   draftsRef: { current: Record<string, ComposerDraft> }
   versionsRef: { current: Record<string, number> }
   deletedDraftKeysRef: { current: Set<string> }
+  clearDraftRef: { current?: (draftKey: string, expectedVersion?: number) => boolean }
   restoreFailedSendRef: { current?: RestoreFailedSend }
 }
 
@@ -20,6 +21,7 @@ const createDraftOwner = (): ComposerDraftOwner => ({
   draftsRef: { current: {} as Record<string, ComposerDraft> },
   versionsRef: { current: {} as Record<string, number> },
   deletedDraftKeysRef: { current: new Set<string>() },
+  clearDraftRef: {},
   restoreFailedSendRef: {}
 })
 
