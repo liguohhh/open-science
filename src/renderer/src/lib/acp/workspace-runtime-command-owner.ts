@@ -41,6 +41,11 @@ import {
   toRuntimeUploadedAttachment,
   type UploadedAttachment
 } from '../../../../shared/uploads'
+import { classifySendAttemptError } from '../../../../shared/send-attempt-diagnostics'
+import {
+  createWorkspaceSendAttempt,
+  type WorkspaceSendAttemptTrace
+} from './workspace-send-attempt'
 import { i18next } from '../../i18n'
 import { validateImageAnnotationSourcesBeforeSend } from '../../pages/workspace/annotations/image-annotation-source-validation'
 import { toPersistedSession, useSessionStore } from '../../stores/session-store'
@@ -318,6 +323,7 @@ const ownsPrompt = (sessionId: string, messageId: string): boolean => {
 }
 
 type PromptDispatch = {
+  trace?: WorkspaceSendAttemptTrace
   providerTarget: Pick<SessionAgentConfiguration, 'providerId' | 'model'> | undefined
   sessionId: string
   messageId: string
@@ -410,6 +416,12 @@ const dispatchPrompt = (
   const referencedSessions = request.referencedSessions?.length
     ? request.referencedSessions
     : undefined
+  const trace = request.trace
+  const finishDispatch = trace?.start('dispatch-prompt')
+  const finishAdmission = trace?.start('prompt-admission')
+  void admission.then((accepted) =>
+    finishAdmission?.(accepted ? 'completed' : request.cancelled?.() ? 'cancelled' : 'failed')
+  )
   let result: ReturnType<WorkspaceCommandRuntime['sendPrompt']>
   try {
     request.beforeDispatch?.()
@@ -434,27 +446,39 @@ const dispatchPrompt = (
         resumeFallback: request.replay?.resumeFallback,
         contextReset: request.replay?.contextReset,
         provenanceContext: promptContext(request.sessionId, request.messageId),
-        memoryEnabled: args[12]
+        memoryEnabled: args[12],
+        ...(trace?.identity ? { sendAttempt: trace.identity } : {})
       })
     } else {
-      result =
-        currentImages?.length || request.parts?.length
+      result = trace?.identity
+        ? runtime.sendPrompt(
+            ...args,
+            referencedSessions,
+            currentImages,
+            request.parts,
+            trace.identity
+          )
+        : currentImages?.length || request.parts?.length
           ? runtime.sendPrompt(...args, referencedSessions, currentImages, request.parts)
           : referencedSessions
             ? runtime.sendPrompt(...args, referencedSessions)
             : runtime.sendPrompt(...args)
     }
   } catch (error) {
+    finishDispatch?.(classifySendAttemptError(error))
+    resolveAdmission(false)
     unsubscribe()
     throw error
   }
   void result
     .then(() => {
+      finishDispatch?.('completed')
       unsubscribe()
       request.accepted?.()
       resolveAdmission(true)
     })
     .catch(async (error) => {
+      finishDispatch?.(classifySendAttemptError(error))
       unsubscribe()
       if (
         request.cancelled?.() &&
@@ -752,10 +776,10 @@ const rejectUnboundPendingPrompt = async (
 const startPendingPrompt = (
   runtime: WorkspaceCommandRuntime,
   request: PendingPromptRequest,
-  onSessionBound?: (pendingSessionId: string, sessionId: string) => void,
-  onPdfContextLinked?: (sessionId: string, pdfContext: MessagePdfContextSnapshot) => void,
-  onSessionSizeLimit?: (sessionId: string) => void,
-  attempt?: WorkspaceSendAttempt
+  onSessionBound: WorkspaceCommandLifecycle['onSessionBound'],
+  onPdfContextLinked: WorkspaceCommandLifecycle['onPdfContextLinked'],
+  onSessionSizeLimit: WorkspaceCommandLifecycle['onSessionSizeLimit'],
+  attempt: WorkspaceSendAttempt
 ): Promise<SendWorkspaceMessageResult | undefined> => {
   let bindingSessionId: string | undefined
   return (async () => {
@@ -783,9 +807,21 @@ const startPendingPrompt = (
         target,
         request.memoryEnabled !== false
       ] as const
-      created = literatureContext
-        ? await runtime.createSession(...createSessionArgs, true, request.setupSessionToken)
-        : await runtime.createSession(...createSessionArgs, undefined, request.setupSessionToken)
+      const identity = attempt.trace.identity
+      created = await attempt.trace.wait('create-session', () =>
+        identity
+          ? runtime.createSession(
+              ...createSessionArgs,
+              literatureContext ? true : undefined,
+              request.setupSessionToken,
+              identity
+            )
+          : runtime.createSession(
+              ...createSessionArgs,
+              literatureContext ? true : undefined,
+              request.setupSessionToken
+            )
+      )
     } catch (error) {
       if (ownsPrompt(pending.sessionId, pending.messageId)) {
         await rejectUnboundPendingPrompt(
@@ -897,12 +933,18 @@ const startPendingPrompt = (
       )
     }))
     try {
-      const durableSeed = await saveSessionInOrder(seed)
+      attempt?.trace.bind(created.sessionId, seed.projectId)
+      attempt?.trace.record({ phase: 'bind-session', result: 'completed' })
+      const durableSeed = await attempt.trace.wait('save-session', () =>
+        saveSessionInOrder(seed, undefined, undefined, { sendAttempt: attempt?.trace.identity })
+      )
       if (attempt?.cancelled || !ownsPrompt(pending.sessionId, pending.messageId)) {
         discardCreated()
         return undefined
       }
-      promptPreparation = await prepareWorkspacePrompt(durableSeed, pending.messageId, 'new')
+      promptPreparation = await attempt.trace.wait('prepare-prompt', () =>
+        prepareWorkspacePrompt(durableSeed, pending.messageId, 'new')
+      )
       if (!ownsPrompt(pending.sessionId, pending.messageId)) {
         await rollbackCancelledPreparation()
         return undefined
@@ -1028,7 +1070,9 @@ const startPendingPrompt = (
         .getState()
         .sessions.find((candidate) => candidate.id === created.sessionId)
       if (!ready) return undefined
-      await saveSessionInOrder(toPersistedSession(ready))
+      await attempt.trace.wait('flush-before-dispatch', () =>
+        saveSessionInOrder(toPersistedSession(ready))
+      )
     } catch (error) {
       if (attempt?.cancelled) return undefined
       if (isSessionSizeLimitError(error)) onSessionSizeLimit?.(created.sessionId)
@@ -1048,6 +1092,7 @@ const startPendingPrompt = (
     }
     try {
       const admission = dispatchPrompt(runtime, {
+        trace: attempt?.trace,
         providerTarget: request.agentConfiguration,
         sessionId: created.sessionId,
         messageId: boundMessageId,
@@ -1137,17 +1182,16 @@ const startPendingPrompt = (
 const performSendWorkspaceMessage = async (
   runtime: WorkspaceCommandRuntime,
   input: SendWorkspaceMessageCommand,
-  lifecycle: WorkspaceCommandLifecycle = {},
-  attempt?: WorkspaceSendAttempt
+  lifecycle: WorkspaceCommandLifecycle,
+  attempt: WorkspaceSendAttempt
 ): Promise<SendWorkspaceMessageResult | undefined> => {
   // The wrapper installs the admission/Stop receipt before hydration can yield.
   const sourceId = input.sessionId ?? input.branchSourceSessionId
   const source = useSessionStore.getState().sessions.find(({ id }) => id === sourceId)
   if (source?.contentLoaded === false) {
-    const loaded = await ensureSessionContentLoaded({
-      projectId: source.projectId,
-      sessionId: source.id
-    })
+    const loaded = await attempt.trace.wait('hydrate-session', () =>
+      ensureSessionContentLoaded({ projectId: source.projectId, sessionId: source.id })
+    )
     if (!loaded || loaded.contentLoaded === false || lifecycle.isCurrent?.() === false)
       return undefined
   }
@@ -1243,6 +1287,7 @@ const performSendWorkspaceMessage = async (
   if (input.branchSourceSessionId) {
     const pending = useSessionStore.getState().branchInNewSession({
       sourceSessionId: input.branchSourceSessionId,
+      messageId: attempt.submissionMessageId,
       content,
       attachments,
       annotations,
@@ -1353,7 +1398,7 @@ const performSendWorkspaceMessage = async (
     const sessionId = input.sessionId
     let session = useSessionStore.getState().sessions.find((item) => item.id === sessionId)
     const stableMessageId = input.messageId?.trim()
-    const submissionMessageId = stableMessageId ?? `message-${crypto.randomUUID()}`
+    const submissionMessageId = attempt.submissionMessageId
     if (input.messageId !== undefined && !stableMessageId) return undefined
     let existingStableMessage = stableMessageId
       ? session?.messages.find((message) => message.id === stableMessageId)
@@ -1421,6 +1466,7 @@ const performSendWorkspaceMessage = async (
       }
       const appended = useSessionStore.getState().appendUserMessage({
         sessionId,
+        messageId: submissionMessageId,
         content,
         attachments: effectiveAttachments,
         annotations,
@@ -1473,7 +1519,9 @@ const performSendWorkspaceMessage = async (
     // Stable application-owned messages already have identity-based retry handling below.
     if (!stableMessageId) {
       try {
-        await (lifecycle.flushPersistence ?? flushSessionPersistence)(`session:${sessionId}`)
+        await attempt.trace.wait('flush-before-send', () =>
+          (lifecycle.flushPersistence ?? flushSessionPersistence)(`session:${sessionId}`)
+        )
       } catch (error) {
         if (lifecycle.isCurrent?.() === false) return undefined
         if (isSessionPersistenceDeferredError(error)) return undefined
@@ -1486,6 +1534,7 @@ const performSendWorkspaceMessage = async (
     }
 
     const prepared = await prepareExistingWorkspacePrompt(runtime, {
+      trace: attempt.trace,
       sessionId,
       requireExistingSession: input.requireExistingSession,
       cwd: input.cwd,
@@ -1521,12 +1570,14 @@ const performSendWorkspaceMessage = async (
         projectId
       })
       if (lifecycle.isCurrent?.() === false) return undefined
-      promptAttachments = await finalizeWorkspaceAttachments({
-        sessionId,
-        attachments: effectiveAttachments,
-        projectId,
-        preserveSourceOwnership: Boolean(input.truncateFromMessageId)
-      })
+      promptAttachments = await attempt.trace.wait('prepare-attachments', () =>
+        finalizeWorkspaceAttachments({
+          sessionId,
+          attachments: effectiveAttachments,
+          projectId,
+          preserveSourceOwnership: Boolean(input.truncateFromMessageId)
+        })
+      )
       if (attempt) attempt.attachments = promptAttachments
       if (lifecycle.isCurrent?.() === false) return undefined
       const pdfContextSources = [
@@ -1611,10 +1662,14 @@ const performSendWorkspaceMessage = async (
     if (!preparationSource) return undefined
     try {
       // Establish the receipt before the first append or edit Branch command can be saved.
-      promptPreparation = await prepareWorkspacePrompt(
-        toPersistedSession(preparationSource),
-        submissionMessageId,
-        rearmExistingStableMessage ? (preparationSource.resumeRecovery ? 'resume' : 'rearm') : 'new'
+      const source = toPersistedSession(preparationSource)
+      const mode = rearmExistingStableMessage
+        ? preparationSource.resumeRecovery
+          ? 'resume'
+          : 'rearm'
+        : 'new'
+      promptPreparation = await attempt.trace.wait('prepare-prompt', () =>
+        prepareWorkspacePrompt(source, submissionMessageId, mode)
       )
     } catch (error) {
       if (isSessionSizeLimitError(error)) lifecycle.onSessionSizeLimit?.(sessionId)
@@ -1649,6 +1704,7 @@ const performSendWorkspaceMessage = async (
         .getState()
         .truncateSessionFromMessage(sessionId, input.truncateFromMessageId, promptPreparation.id)
     }
+    const finishAppend = attempt.trace.start('append-user')
     const appended = useSessionStore.getState().appendUserMessage({
       sessionId,
       messageId: submissionMessageId,
@@ -1675,6 +1731,7 @@ const performSendWorkspaceMessage = async (
       // Preparing a send must not undo navigation that happened while it was awaiting I/O.
       preserveSelection: input.preserveSelection || attempt?.selectionChanged
     })
+    finishAppend(appended ? 'completed' : 'failed')
     if (!appended) return undefined
     input.onMessageAppended?.(appended)
     // Application-owned stable identities need an explicit save because they may be dispatched
@@ -1696,7 +1753,9 @@ const performSendWorkspaceMessage = async (
         .sessions.find((candidate) => candidate.id === sessionId)
       if (!durableSession) return undefined
       try {
-        await saveSessionInOrder(toPersistedSession(durableSession))
+        await attempt.trace.wait('flush-before-dispatch', () =>
+          saveSessionInOrder(toPersistedSession(durableSession))
+        )
       } catch (error) {
         if (attempt?.cancelled) return undefined
         if (isSessionPersistenceDeferredError(error)) return undefined
@@ -1713,7 +1772,9 @@ const performSendWorkspaceMessage = async (
       if (!ownsPrompt(sessionId, appended.messageId)) return undefined
     } else if (!rearmExistingStableMessage) {
       try {
-        await (lifecycle.flushPersistence ?? flushSessionPersistence)(`session:${sessionId}`)
+        await attempt.trace.wait('flush-before-dispatch', () =>
+          (lifecycle.flushPersistence ?? flushSessionPersistence)(`session:${sessionId}`)
+        )
       } catch (error) {
         if (attempt?.cancelled) return undefined
         if (isSessionPersistenceDeferredError(error)) return undefined
@@ -1741,6 +1802,7 @@ const performSendWorkspaceMessage = async (
         : undefined
     try {
       const admission = dispatchPrompt(runtime, {
+        trace: attempt.trace,
         providerTarget: input.agentConfiguration,
         sessionId,
         messageId: appended.messageId,
@@ -1797,6 +1859,7 @@ const performSendWorkspaceMessage = async (
   }
 
   const pending = useSessionStore.getState().appendPendingUserMessage({
+    messageId: attempt.submissionMessageId,
     content,
     attachments,
     annotations,
@@ -1855,6 +1918,8 @@ const performSendWorkspaceMessage = async (
 }
 
 type WorkspaceSendAttempt = {
+  submissionMessageId: string
+  trace: WorkspaceSendAttemptTrace
   selectionChanged: boolean
   cancellationEligible: boolean
   cancelled: boolean
@@ -1957,7 +2022,21 @@ const sendWorkspaceMessage = async (
     stop = () => resolve(undefined)
   })
   const visibleSessionIds = new Set<string>()
+  const submissionMessageId = input.messageId?.trim() || `message-${crypto.randomUUID()}`
+  const trace = createWorkspaceSendAttempt(
+    submissionMessageId,
+    input.branchSourceSessionId
+      ? 'branch-to-new-session'
+      : sessionId && !previousSession?.isPending
+        ? 'existing-session'
+        : 'new-session',
+    input.projectId ?? previousSession?.projectId,
+    sessionId
+  )
+  const finishSend = trace.start('send')
   const attempt: WorkspaceSendAttempt = {
+    submissionMessageId,
+    trace,
     selectionChanged: false,
     cancellationEligible:
       !input.allowCompactionRecovery &&
@@ -2003,6 +2082,10 @@ const sendWorkspaceMessage = async (
       ...input,
       onMessageAppended: (message) => {
         attempt.message = message
+        trace.bind(
+          message.sessionId,
+          useSessionStore.getState().sessions.find(({ id }) => id === message.sessionId)?.projectId
+        )
         trackWorkspaceSendPreparation(attempt, message.sessionId)
         input.onMessageAppended?.(message)
       },
@@ -2010,6 +2093,7 @@ const sendWorkspaceMessage = async (
         attempt.failed = true
         attempt.endPresentation()
         input.onPreparationRejected?.(error, id, attachments)
+        trace.record({ phase: 'composer-feedback', result: 'completed', detail: 'error-reported' })
       }
     },
     {
@@ -2020,22 +2104,38 @@ const sendWorkspaceMessage = async (
     },
     attempt
   )
-  const finish = async (): Promise<void> => {
+  const finish = async (result?: SendWorkspaceMessageResult, error?: unknown): Promise<void> => {
     try {
-      if (attempt.pendingPreparation) await attempt.pendingPreparation
-      if (attempt.promptAdmission) await attempt.promptAdmission
+      if (attempt.pendingPreparation) result = await attempt.pendingPreparation
+      if (attempt.promptAdmission && !(await attempt.promptAdmission)) result = undefined
       if (attempt.rollback) await attempt.rollback
       if (attempt.cancelled && !attempt.dispatched && attempt.preparation)
         await attemptWorkspacePromptRollback(attempt.preparation)
       if (attempt.cleanup) await attempt.cleanup
+    } catch (failure) {
+      error = failure
+      throw failure
     } finally {
+      finishSend(
+        attempt.cancelled
+          ? 'cancelled'
+          : error
+            ? classifySendAttemptError(error)
+            : attempt.failed || !result
+              ? 'failed'
+              : 'completed'
+      )
       unsubscribeSelection()
+      trace.release()
       attempt.endPresentation()
       for (const id of attempt.sessionIds)
         if (preparingSessionAttempts.get(id) === attempt) preparingSessionAttempts.delete(id)
     }
   }
-  attempt.settlement = operation.then(finish, finish)
+  attempt.settlement = operation.then(
+    (result) => finish(result),
+    (error) => finish(undefined, error)
+  )
   void attempt.settlement.catch((error) => console.warn('Prompt preparation cleanup failed', error))
   return Promise.race([operation, stopped])
 }

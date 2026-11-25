@@ -1,3 +1,4 @@
+import { workspaceMessageSendAttempt } from '../acp/workspace-send-attempt'
 import {
   useDesktopRuntimeRecoveryStore,
   getDesktopRuntimeEpoch,
@@ -1163,6 +1164,7 @@ const mergeSaveSessionOptions = (
       ? next.runtimeWriterToken
       : previous?.runtimeWriterToken
   const expectedRevision = next?.expectedRevision ?? previous?.expectedRevision
+  const sendAttempt = next?.sendAttempt ?? previous?.sendAttempt
   const conversationCommands = [
     ...(previous?.conversationCommands ?? []),
     ...(next?.conversationCommands ?? [])
@@ -1172,23 +1174,54 @@ const mergeSaveSessionOptions = (
   return expectedRevision !== undefined ||
     conflictRebaseFields.length > 0 ||
     runtimeWriterToken ||
+    sendAttempt ||
     conversationCommands.length > 0
     ? {
         ...(expectedRevision !== undefined ? { expectedRevision } : {}),
         ...(runtimeWriterToken ? { runtimeWriterToken } : {}),
+        ...(sendAttempt ? { sendAttempt } : {}),
         ...(conflictRebaseFields.length > 0 ? { conflictRebaseFields } : {}),
         ...(conversationCommands.length > 0 ? { conversationCommands } : {})
       }
     : undefined
 }
 
+const sendAttemptSaveOption = (
+  sessionId: string,
+  commands: NonNullable<SaveSessionOptions['conversationCommands']>
+): Pick<SaveSessionOptions, 'sendAttempt'> => {
+  const prompt = commands.find(
+    (command) =>
+      command.kind === 'prepare-prompt' ||
+      command.kind === 'append-user' ||
+      command.kind === 'start-run' ||
+      command.kind === 'resume-run'
+  )
+  const promptId =
+    prompt?.kind === 'prepare-prompt'
+      ? prompt.promptMessageId
+      : prompt?.kind === 'append-user'
+        ? prompt.message.id
+        : prompt?.kind === 'start-run' || prompt?.kind === 'resume-run'
+          ? prompt.run.promptMessageId
+          : undefined
+  const sendAttempt = workspaceMessageSendAttempt(sessionId, promptId)
+  return sendAttempt ? { sendAttempt } : {}
+}
+
 const withPendingConversationCommands = (
   session: PersistedChatSession,
   options: SaveSessionOptions | undefined
-): SaveSessionOptions | undefined =>
-  mergeSaveSessionOptions(options, {
-    conversationCommands: pendingSessionConversationCommands(session.id)
+): SaveSessionOptions | undefined => {
+  const conversationCommands = pendingSessionConversationCommands(session.id)
+  return mergeSaveSessionOptions(options, {
+    conversationCommands,
+    ...sendAttemptSaveOption(session.id, [
+      ...(options?.conversationCommands ?? []),
+      ...conversationCommands
+    ])
   })
+}
 
 const LATEST_SESSION_SAVE_INTERVAL_MS = 500
 // While a turn is streaming, intermediate flushes only bound crash loss and the terminal commit
@@ -2859,7 +2892,8 @@ const createStoreSaver = (
             ? {
                 ...(conflictRebaseFields.length > 0 ? { conflictRebaseFields } : {}),
                 ...(writerOptions ?? {}),
-                ...(conversationCommands.length > 0 ? { conversationCommands } : {})
+                ...(conversationCommands.length > 0 ? { conversationCommands } : {}),
+                ...sendAttemptSaveOption(session.id, conversationCommands)
               }
             : undefined
         let recoveryOptions = saveOptions

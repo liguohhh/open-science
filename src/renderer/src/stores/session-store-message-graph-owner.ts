@@ -525,6 +525,7 @@ export const createSessionMessageGraphOwner = <
       isPending: true
     }),
   branchInNewSession: ({
+    messageId,
     sourceSessionId,
     sourceMessageId,
     content,
@@ -570,7 +571,7 @@ export const createSessionMessageGraphOwner = <
       ? undefined
       : {
           ...buildUserMessage({
-            id: createMessageId(),
+            id: messageId ?? createMessageId(),
             content: trimmedContent,
             uploads,
             parts,

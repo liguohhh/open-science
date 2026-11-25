@@ -1,3 +1,5 @@
+import { readSendAttemptEvent, type SendAttemptEvent } from './send-attempt-diagnostics'
+
 export const RENDERER_FAILURE_CHANNEL = 'diagnostics:renderer-failure'
 
 export const RENDERER_FAILURE_SOURCES = [
@@ -191,6 +193,7 @@ export type RendererFailureReport = {
   context?: RendererFailureContext
   fingerprint?: string
   sessionWrite?: RendererSessionWriteDiagnostics
+  sendAttempt?: SendAttemptEvent
 }
 
 const isOneOf = <Value extends string>(values: readonly Value[], value: unknown): value is Value =>
@@ -204,9 +207,15 @@ export const isRendererFailureReport = (value: unknown): value is RendererFailur
   if (
     keys.some(
       (key) =>
-        !['source', 'surface', 'errorCategory', 'context', 'fingerprint', 'sessionWrite'].includes(
-          key
-        )
+        ![
+          'source',
+          'surface',
+          'errorCategory',
+          'context',
+          'fingerprint',
+          'sessionWrite',
+          'sendAttempt'
+        ].includes(key)
     )
   ) {
     return false
@@ -220,6 +229,7 @@ export const isRendererFailureReport = (value: unknown): value is RendererFailur
     isOneOf(RENDERER_FAILURE_SURFACES, record.surface) &&
     isOneOf(RENDERER_ERROR_CATEGORIES, record.errorCategory) &&
     (record.context === undefined || isOneOf(RENDERER_FAILURE_CONTEXTS, record.context)) &&
+    (record.sendAttempt === undefined || !!readSendAttemptEvent(record.sendAttempt)) &&
     (record.sessionWrite === undefined || isRendererSessionWriteDiagnostics(record.sessionWrite)) &&
     (record.fingerprint === undefined ||
       (typeof record.fingerprint === 'string' && /^[a-f0-9]{8,64}$/.test(record.fingerprint)))
