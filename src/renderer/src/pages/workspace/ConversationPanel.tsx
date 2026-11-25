@@ -1066,6 +1066,9 @@ const ConversationPanel = ({
       ? state.failures?.[activeSession.id]
       : undefined
   )
+  const unconfirmedSendStorage = useWorkspaceOperationErrors((state) =>
+    activeSession ? state.unconfirmedSendStorage[activeSession.id] === true : false
+  )
   const optimizationProjectId = useNavigationStore((state) => state.activeProjectId)
   const promptOptimizationModel = useSettingsStore((state) => state.promptOptimizationModel)
   const labStateExpired = useSettingsStore((state) => state.lab?.state === 'expired')
@@ -1143,6 +1146,10 @@ const ConversationPanel = ({
       {
         id: 'action',
         message: attachmentNotice && actionError === composerError ? undefined : actionError,
+        summary:
+          operationFailure?.reason === 'session/send-storage-timeout' && actionError
+            ? { title: t('Conversation storage needs attention'), description: actionError }
+            : undefined,
         failure: operationFailure ?? (actionError === composerError ? composerFailure : undefined),
         detail:
           operationDiagnostic?.message === actionError ? operationDiagnostic.detail : undefined,
@@ -1496,10 +1503,12 @@ const ConversationPanel = ({
       available: (notice) =>
         notice.operation === 'reconfigure' ||
         notice.recovery === 'retry-artifact-publication' ||
+        notice.failure.reason === 'session/send-storage-timeout' ||
         Boolean(notice.promptMessageId) ||
         (notice.operation === 'action' && operationDiagnostic?.operation === 'resume'),
       run: async (notice) => {
         if (notice.operation === 'reconfigure') return onReconfigureRetry()
+        if (notice.failure.reason === 'session/send-storage-timeout') return handleSubmit()
         if (notice.recovery === 'retry-artifact-publication' && notice.promptMessageId)
           return transcriptHandlers.retryArtifact(notice.promptMessageId)
         if (notice.promptMessageId) {
@@ -1524,9 +1533,11 @@ const ConversationPanel = ({
           ? specialistSwitchInFlight
           : notice.recovery === 'retry-artifact-publication'
             ? artifactRetryDisabled
-            : notice.promptMessageId
-              ? isImported || !conversation.availability.revise || rootTurnBusy
-              : !canResumeSession || isResuming || isStopping || rootTurnBusy
+            : notice.failure.reason === 'session/send-storage-timeout'
+              ? unconfirmedSendStorage || !effectiveCanSend || rootTurnBusy
+              : notice.promptMessageId
+                ? isImported || !conversation.availability.revise || rootTurnBusy
+                : !canResumeSession || isResuming || isStopping || rootTurnBusy
     },
     'open-provider-settings': {
       run: (notice) => {

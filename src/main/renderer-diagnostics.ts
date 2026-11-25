@@ -237,9 +237,13 @@ export const createRendererFailureReporter = (
       const recovery = report.sessionWrite?.recovery
       if (recovery) {
         if (
-          ['retained', 'reconcile-unconfirmed', 'retry-failed', 'discard-failed'].includes(
-            recovery.event
-          )
+          [
+            'send-timeout',
+            'retained',
+            'reconcile-unconfirmed',
+            'retry-failed',
+            'discard-failed'
+          ].includes(recovery.event)
         )
           warn('session storage recovery', report)
         else info('session storage recovery', report)

@@ -84,6 +84,11 @@ export const noticeCatalog = {
 
 // Unknown reasons retain category copy.
 export const reasonCatalog: Partial<Record<FailureReason, NoticePresentation>> = {
+  'session/send-storage-timeout': {
+    ...noticeCatalog.session,
+    level: 'warning',
+    primaryAction: 'retry'
+  },
   'configuration/model-unavailable': {
     level: 'warning',
     titleKey: 'Model configuration needs attention',

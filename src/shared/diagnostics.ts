@@ -65,6 +65,7 @@ export const SESSION_WRITE_FAILURE_CODES = [
 ] as const
 
 export const SESSION_WRITE_RECOVERY_EVENTS = [
+  'send-timeout',
   'retained',
   'reconcile-started',
   'reconcile-unconfirmed',
@@ -79,6 +80,13 @@ export const SESSION_WRITE_RECOVERY_EVENTS = [
   'warning-dismissed',
   'forgotten'
 ] as const
+
+export const SESSION_SEND_STORAGE_OPERATIONS = [
+  'flush-before-send',
+  'prepare-prompt',
+  'flush-before-dispatch'
+] as const
+export type SessionSendStorageOperation = (typeof SESSION_SEND_STORAGE_OPERATIONS)[number]
 
 export const SESSION_WRITE_RECOVERY_REASONS = [
   'save-acknowledged',
@@ -96,6 +104,8 @@ export const SESSION_WRITE_RECOVERY_REASONS = [
 
 export type RendererSessionWriteRecoveryDiagnostics = Readonly<{
   event: (typeof SESSION_WRITE_RECOVERY_EVENTS)[number]
+  operation?: SessionSendStorageOperation
+  promptMessageId?: string
   reason?: (typeof SESSION_WRITE_RECOVERY_REASONS)[number]
   state?: 'checking' | 'failed'
   notice?: 'checking' | 'attention' | 'size-limit' | 'hidden'
@@ -120,6 +130,8 @@ const isRendererSessionWriteRecoveryDiagnostics = (
     Object.keys(record).every((key) =>
       [
         'event',
+        'operation',
+        'promptMessageId',
         'reason',
         'state',
         'notice',
@@ -133,6 +145,11 @@ const isRendererSessionWriteRecoveryDiagnostics = (
       ].includes(key)
     ) &&
     isOneOf(SESSION_WRITE_RECOVERY_EVENTS, record.event) &&
+    (record.operation === undefined ||
+      isOneOf(SESSION_SEND_STORAGE_OPERATIONS, record.operation)) &&
+    (record.promptMessageId === undefined ||
+      (typeof record.promptMessageId === 'string' &&
+        /^[a-zA-Z0-9_-]{1,128}$/.test(record.promptMessageId))) &&
     (record.reason === undefined || isOneOf(SESSION_WRITE_RECOVERY_REASONS, record.reason)) &&
     (record.state === undefined || isOneOf(['checking', 'failed'], record.state)) &&
     (record.notice === undefined ||

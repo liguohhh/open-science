@@ -624,7 +624,8 @@ const useWorkspaceConversationController = (
         const restorePreparation = (
           rejectedSessionId?: string,
           finalizedAttachments?: UploadedAttachment[],
-          message?: string
+          message?: string,
+          retryMessageId?: string
         ): void => {
           preparationRejected = true
           clearOptimisticMessage()
@@ -634,12 +635,16 @@ const useWorkspaceConversationController = (
             wasNewConversation || branchInNewSession
               ? (rejectedSessionId ?? snapshot.draftKey)
               : snapshot.draftKey
-          if (message && latest.currentDraftKey === targetDraftKey)
+          if (message && !retryMessageId && latest.currentDraftKey === targetDraftKey)
             latest.composer.actions.setError(message)
           const rejectedOwner = rejectedSessionId ? latest.getSession(rejectedSessionId) : undefined
           const retrySessionOwner =
             rejectedOwner && !rejectedOwner.isPending
-              ? { sessionId: rejectedOwner.id, projectId: rejectedOwner.projectId }
+              ? {
+                  sessionId: rejectedOwner.id,
+                  projectId: rejectedOwner.projectId,
+                  ...(retryMessageId ? { messageId: retryMessageId } : {})
+                }
               : snapshot.retrySessionOwner
           const byId = new Map(
             finalizedAttachments?.map((attachment) => [attachment.id, attachment])
@@ -662,6 +667,9 @@ const useWorkspaceConversationController = (
         void runtime
           .sendMessage({
             sessionId,
+            ...(snapshot.retrySessionOwner?.messageId
+              ? { messageId: snapshot.retrySessionOwner.messageId, retryStorageTimeout: true }
+              : {}),
             onPromptAccepted: acceptDraft,
             onMessageAppended: (message) => {
               consumePdfProseReading()
@@ -671,8 +679,13 @@ const useWorkspaceConversationController = (
                 current.onNewSessionAppended?.(message)
               }
             },
-            onPreparationRejected: (message, rejectedSessionId, finalizedAttachments) =>
-              restorePreparation(rejectedSessionId, finalizedAttachments, message),
+            onPreparationRejected: (
+              message,
+              rejectedSessionId,
+              finalizedAttachments,
+              retryMessageId
+            ) =>
+              restorePreparation(rejectedSessionId, finalizedAttachments, message, retryMessageId),
             onPreparationCancelled: (cancelledSessionId, finalizedAttachments) =>
               restorePreparation(cancelledSessionId, finalizedAttachments),
             ...(branchInNewSession && activeSession

@@ -68,6 +68,7 @@ import type { useAcpRuntime } from './useAcpRuntime'
 import {
   clearWorkspaceOperationError,
   reportWorkspaceOperationError,
+  setUnconfirmedWorkspaceSendStorage,
   useWorkspaceOperationErrors
 } from './workspace-operation-error'
 import {
@@ -75,11 +76,16 @@ import {
   hasPendingWorkspacePromptRollback,
   ownsWorkspacePromptPreparation,
   prepareWorkspacePrompt,
+  reconcileExpiredWorkspacePrompt,
   retryPendingWorkspacePromptRollback,
   rollbackWorkspacePrompt,
   withdrawWorkspacePrompt,
   type WorkspacePromptPreparation
 } from './workspace-prompt-preparation'
+import {
+  waitForWorkspaceSendStorage,
+  WorkspaceSendStorageTimeout
+} from './workspace-send-storage-deadline'
 import {
   finalizeWorkspaceAttachments,
   partitionWorkspacePromptAttachments
@@ -100,6 +106,7 @@ type SendWorkspaceMessageIntent = {
   sessionId?: string
   // Optional durable caller identity for restart-safe application-owned prompts.
   messageId?: string
+  retryStorageTimeout?: boolean
   // Renderer-only notification: the real message now replaces the composer's pending preview.
   onMessageAppended?: (message: SendWorkspaceMessageResult) => void
   // Main has admitted this prompt; optimistic append alone does not establish ownership.
@@ -107,7 +114,8 @@ type SendWorkspaceMessageIntent = {
   onPreparationRejected?: (
     error: string,
     sessionId?: string,
-    attachments?: UploadedAttachment[]
+    attachments?: UploadedAttachment[],
+    retryMessageId?: string
   ) => void
   onPreparationCancelled?: (sessionId?: string, attachments?: UploadedAttachment[]) => void
   branchSourceSessionId?: string
@@ -255,27 +263,36 @@ const recoverPromptAttachments = (
 }
 const rejectPreparedPrompt = async (
   sessionId: string,
-  message: string,
+  error: string | WorkspaceSendStorageTimeout,
   preparation: WorkspacePromptPreparation | undefined,
-  rejected:
-    ((error: string, sessionId?: string, attachments?: UploadedAttachment[]) => void) | undefined,
+  rejected: SendWorkspaceMessageIntent['onPreparationRejected'],
   providerTarget: Pick<SessionAgentConfiguration, 'providerId' | 'model'> | undefined
 ): Promise<void> => {
   if (preparingSessionAttempts.get(sessionId)?.cancelled) return
   if (preparation && !ownsWorkspacePromptPreparation(preparation)) return
   const attempt = preparingSessionAttempts.get(sessionId)
+  const timeout = error instanceof WorkspaceSendStorageTimeout ? error : undefined
+  const message = typeof error === 'string' ? error : error.message
   if (attempt) {
     attempt.failed = true
     attempt.endPresentation()
   }
-  const restoredAttachments = recoverPromptAttachments(sessionId, preparation?.promptMessageId)
+  const restoredAttachments =
+    recoverPromptAttachments(
+      sessionId,
+      preparation?.promptMessageId ?? timeout?.wait.promptMessageId
+    ) ?? (timeout ? attempt?.attachments : undefined)
   // Start compensation before removing optimistic intents; keep the exact write protected.
   const cleanup = preparation ? attemptWorkspacePromptRollback(preparation) : undefined
   if (attempt) attempt.rollback = cleanup
   if (preparation) withdrawWorkspacePrompt(preparation)
   markPendingSessionRetryable(sessionId)
-  reportWorkspaceOperationError(sessionId, message, { providerTarget })
-  rejected?.(message, sessionId, restoredAttachments)
+  reportWorkspaceOperationError(sessionId, message, {
+    providerTarget,
+    sendStorageTimeout: Boolean(timeout)
+  })
+  if (timeout) rejected?.(message, sessionId, restoredAttachments, timeout.wait.promptMessageId)
+  else rejected?.(message, sessionId, restoredAttachments)
   void cleanup?.then(({ failure }) => {
     if (failure !== undefined) console.warn('Unsent prompt rollback failed', failure)
   })
@@ -1199,7 +1216,33 @@ const performSendWorkspaceMessage = async (
   if (input.sessionId) clearWorkspaceOperationError(input.sessionId)
   if (input.sessionId && hasPendingWorkspacePromptRollback(input.sessionId)) {
     // A prior rejected preparation whose rollback failed still owns the Session in Main.
-    const { failure } = await retryPendingWorkspacePromptRollback(input.sessionId)
+    const sessionId = input.sessionId
+    const rollback = retryPendingWorkspacePromptRollback(sessionId)
+    let result: Awaited<typeof rollback>
+    try {
+      result = await waitForWorkspaceSendStorage(
+        {
+          operation: 'prepare-prompt',
+          sessionId,
+          projectId: source?.projectId,
+          promptMessageId: input.messageId ?? attempt.submissionMessageId
+        },
+        rollback,
+        attempt.trace
+      )
+    } catch (error) {
+      if (!(error instanceof WorkspaceSendStorageTimeout)) throw error
+      retainExpiredStorageWait(attempt, error, rollback)
+      await rejectPreparedPrompt(
+        sessionId,
+        error,
+        undefined,
+        input.onPreparationRejected,
+        input.agentConfiguration
+      )
+      return undefined
+    }
+    const { failure } = result
     if (failure !== undefined) {
       reportWorkspaceOperationError(input.sessionId, failure)
       return undefined
@@ -1517,12 +1560,32 @@ const performSendWorkspaceMessage = async (
 
     // An unresolved earlier save must not append another unsent user Message on every retry.
     // Stable application-owned messages already have identity-based retry handling below.
-    if (!stableMessageId) {
+    if (!stableMessageId || input.retryStorageTimeout) {
+      const flush = (lifecycle.flushPersistence ?? flushSessionPersistence)(`session:${sessionId}`)
       try {
-        await attempt.trace.wait('flush-before-send', () =>
-          (lifecycle.flushPersistence ?? flushSessionPersistence)(`session:${sessionId}`)
+        await waitForWorkspaceSendStorage(
+          {
+            operation: 'flush-before-send',
+            sessionId,
+            projectId,
+            promptMessageId: submissionMessageId
+          },
+          flush,
+          attempt.trace
         )
       } catch (error) {
+        if (error instanceof WorkspaceSendStorageTimeout) {
+          retainExpiredStorageWait(attempt, error, flush)
+          if (lifecycle.isCurrent?.() !== false)
+            await rejectPreparedPrompt(
+              sessionId,
+              error,
+              undefined,
+              input.onPreparationRejected,
+              input.agentConfiguration
+            )
+          return undefined
+        }
         if (lifecycle.isCurrent?.() === false) return undefined
         if (isSessionPersistenceDeferredError(error)) return undefined
         if (isSessionSizeLimitError(error)) lifecycle.onSessionSizeLimit?.(sessionId)
@@ -1660,22 +1723,37 @@ const performSendWorkspaceMessage = async (
       }
     }
     if (!preparationSource) return undefined
+    const preparationDeadline = new AbortController()
+    const receipt = {
+      id: `prompt-preparation-${crypto.randomUUID()}`,
+      sessionId,
+      promptMessageId: submissionMessageId,
+      authority: toPersistedSession(preparationSource)
+    }
+    const preparationWrite = prepareWorkspacePrompt(
+      receipt.authority,
+      submissionMessageId,
+      rearmExistingStableMessage ? (preparationSource.resumeRecovery ? 'resume' : 'rearm') : 'new',
+      { id: receipt.id, signal: preparationDeadline.signal }
+    )
     try {
       // Establish the receipt before the first append or edit Branch command can be saved.
-      const source = toPersistedSession(preparationSource)
-      const mode = rearmExistingStableMessage
-        ? preparationSource.resumeRecovery
-          ? 'resume'
-          : 'rearm'
-        : 'new'
-      promptPreparation = await attempt.trace.wait('prepare-prompt', () =>
-        prepareWorkspacePrompt(source, submissionMessageId, mode)
+      promptPreparation = await waitForWorkspaceSendStorage(
+        { operation: 'prepare-prompt', sessionId, projectId, promptMessageId: submissionMessageId },
+        preparationWrite,
+        attempt.trace
       )
     } catch (error) {
+      if (error instanceof WorkspaceSendStorageTimeout) {
+        preparationDeadline.abort(error)
+        retainExpiredStorageWait(attempt, error, preparationWrite, (prepared) =>
+          reconcileExpiredWorkspacePrompt(prepared ?? receipt)
+        )
+      }
       if (isSessionSizeLimitError(error)) lifecycle.onSessionSizeLimit?.(sessionId)
       await rejectPreparedPrompt(
         sessionId,
-        errorMessage(error),
+        error instanceof WorkspaceSendStorageTimeout ? error : errorMessage(error),
         undefined,
         input.onPreparationRejected,
         input.agentConfiguration
@@ -1744,6 +1822,7 @@ const performSendWorkspaceMessage = async (
       rearmExistingStableMessage &&
       useSessionStore.getState().sessions.find((candidate) => candidate.id === sessionId)
         ?.runtimeTranscriptOwner === 'main'
+    let persistence: Promise<unknown> | undefined
     if (
       stableMessageId &&
       (!(input.allowCompactionRecovery && rearmExistingStableMessage) || mainOwnedRecovery)
@@ -1752,30 +1831,42 @@ const performSendWorkspaceMessage = async (
         .getState()
         .sessions.find((candidate) => candidate.id === sessionId)
       if (!durableSession) return undefined
-      try {
-        await attempt.trace.wait('flush-before-dispatch', () =>
-          saveSessionInOrder(toPersistedSession(durableSession))
-        )
-      } catch (error) {
-        if (attempt?.cancelled) return undefined
-        if (isSessionPersistenceDeferredError(error)) return undefined
-        if (isSessionSizeLimitError(error)) lifecycle.onSessionSizeLimit?.(sessionId)
-        await rejectPreparedPrompt(
-          sessionId,
-          errorMessage(error),
-          promptPreparation,
-          input.onPreparationRejected,
-          input.agentConfiguration
-        )
-        return undefined
-      }
-      if (!ownsPrompt(sessionId, appended.messageId)) return undefined
+      persistence = saveSessionInOrder(toPersistedSession(durableSession))
     } else if (!rearmExistingStableMessage) {
+      persistence = (lifecycle.flushPersistence ?? flushSessionPersistence)(`session:${sessionId}`)
+    }
+    if (persistence) {
       try {
-        await attempt.trace.wait('flush-before-dispatch', () =>
-          (lifecycle.flushPersistence ?? flushSessionPersistence)(`session:${sessionId}`)
+        await waitForWorkspaceSendStorage(
+          {
+            operation: 'flush-before-dispatch',
+            sessionId,
+            projectId,
+            promptMessageId: submissionMessageId
+          },
+          persistence,
+          attempt.trace
         )
       } catch (error) {
+        if (error instanceof WorkspaceSendStorageTimeout) {
+          const prepared = promptPreparation
+          retainExpiredStorageWait(attempt, error, persistence, async () => {
+            const outcome = await reconcileExpiredWorkspacePrompt(prepared)
+            if (attempt.preparation === prepared) attempt.preparation = undefined
+            return outcome
+          })
+          if (!attempt.cancelled) {
+            await rejectPreparedPrompt(
+              sessionId,
+              error,
+              undefined,
+              input.onPreparationRejected,
+              input.agentConfiguration
+            )
+            withdrawWorkspacePrompt(prepared)
+          }
+          return undefined
+        }
         if (attempt?.cancelled) return undefined
         if (isSessionPersistenceDeferredError(error)) return undefined
         if (isSessionSizeLimitError(error)) lifecycle.onSessionSizeLimit?.(sessionId)
@@ -1930,6 +2021,8 @@ type WorkspaceSendAttempt = {
   pendingPreparation?: Promise<SendWorkspaceMessageResult | undefined>
   promptAdmission?: Promise<boolean>
   rollback?: ReturnType<typeof attemptWorkspacePromptRollback>
+  storageTimeout?: WorkspaceSendStorageTimeout
+  lateStorage?: Promise<void>
   cleanup?: Promise<SessionDeletionResult>
   settlement?: Promise<void>
   bindForCancellation?: () => string | undefined
@@ -1940,6 +2033,44 @@ type WorkspaceSendAttempt = {
   notifyPreparation?: WorkspaceCommandLifecycle['onSendPreparationStateChange']
   restore: SendWorkspaceMessageIntent['onPreparationCancelled']
   stop: () => void
+}
+
+const retainExpiredStorageWait = <Result>(
+  attempt: WorkspaceSendAttempt,
+  timeout: WorkspaceSendStorageTimeout,
+  work: Promise<Result>,
+  reconcile?: (result?: Result) => Promise<{ failure?: string }>
+): void => {
+  attempt.storageTimeout = timeout
+  setUnconfirmedWorkspaceSendStorage(timeout.wait.sessionId, true)
+  // 用户看到超时后，旧写入仍保有原顺序。等待它结束并清理回执后才允许同一会话重试。
+  const late = async (acknowledged: boolean, result?: Result): Promise<void> => {
+    const outcome = await reconcile?.(result)
+    attempt.trace.record({
+      phase: timeout.wait.operation,
+      result: 'late-result',
+      detail: outcome?.failure
+        ? 'unconfirmed'
+        : reconcile
+          ? 'reconciled'
+          : acknowledged
+            ? 'acknowledged'
+            : 'unconfirmed'
+    })
+  }
+  attempt.lateStorage = work
+    .then(
+      (result) => late(true, result),
+      () => late(false)
+    )
+    .catch((error) => {
+      attempt.trace.record({
+        phase: timeout.wait.operation,
+        result: 'late-result',
+        detail: 'unconfirmed'
+      })
+      console.warn('Timed-out prompt storage reconciliation failed', error)
+    })
 }
 const preparingSessionAttempts = new Map<string, WorkspaceSendAttempt>()
 const trackWorkspaceSendPreparation = (attempt: WorkspaceSendAttempt, sessionId: string): void => {
@@ -2000,6 +2131,15 @@ const sendWorkspaceMessage = async (
   )
     return undefined
   const existingAttempt = sessionId ? preparingSessionAttempts.get(sessionId) : undefined
+  if (sessionId && existingAttempt?.storageTimeout) {
+    const timeout = existingAttempt.storageTimeout
+    reportWorkspaceOperationError(sessionId, timeout.message, { sendStorageTimeout: true })
+    // 编辑过的草稿是另一条消息，不能继承已落盘的旧消息 ID。
+    if (input.messageId)
+      input.onPreparationRejected?.(timeout.message, sessionId, input.attachments, input.messageId)
+    else input.onPreparationCancelled?.(sessionId, input.attachments)
+    return undefined
+  }
   if (
     existingAttempt?.dispatched === false &&
     !(
@@ -2089,10 +2229,11 @@ const sendWorkspaceMessage = async (
         trackWorkspaceSendPreparation(attempt, message.sessionId)
         input.onMessageAppended?.(message)
       },
-      onPreparationRejected: (error, id, attachments) => {
+      onPreparationRejected: (error, id, attachments, retryMessageId) => {
         attempt.failed = true
         attempt.endPresentation()
-        input.onPreparationRejected?.(error, id, attachments)
+        if (retryMessageId) input.onPreparationRejected?.(error, id, attachments, retryMessageId)
+        else input.onPreparationRejected?.(error, id, attachments)
         trace.record({ phase: 'composer-feedback', result: 'completed', detail: 'error-reported' })
       }
     },
@@ -2107,6 +2248,7 @@ const sendWorkspaceMessage = async (
   const finish = async (result?: SendWorkspaceMessageResult, error?: unknown): Promise<void> => {
     try {
       if (attempt.pendingPreparation) result = await attempt.pendingPreparation
+      if (attempt.lateStorage) await attempt.lateStorage
       if (attempt.promptAdmission && !(await attempt.promptAdmission)) result = undefined
       if (attempt.rollback) await attempt.rollback
       if (attempt.cancelled && !attempt.dispatched && attempt.preparation)
@@ -2119,17 +2261,23 @@ const sendWorkspaceMessage = async (
       finishSend(
         attempt.cancelled
           ? 'cancelled'
-          : error
-            ? classifySendAttemptError(error)
-            : attempt.failed || !result
-              ? 'failed'
-              : 'completed'
+          : attempt.storageTimeout
+            ? 'timed-out'
+            : error
+              ? classifySendAttemptError(error)
+              : attempt.failed || !result
+                ? 'failed'
+                : 'completed'
       )
       unsubscribeSelection()
       trace.release()
       attempt.endPresentation()
       for (const id of attempt.sessionIds)
-        if (preparingSessionAttempts.get(id) === attempt) preparingSessionAttempts.delete(id)
+        if (preparingSessionAttempts.get(id) === attempt) {
+          preparingSessionAttempts.delete(id)
+          if (attempt.storageTimeout?.wait.sessionId === id)
+            setUnconfirmedWorkspaceSendStorage(id, false)
+        }
     }
   }
   attempt.settlement = operation.then(
