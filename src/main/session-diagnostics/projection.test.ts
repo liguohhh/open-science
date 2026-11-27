@@ -1,8 +1,36 @@
 import { describe, expect, it } from 'vitest'
 
+import { OPENCODE_CLASSIFICATION_FAILURE_EVENT } from '../diagnostics/opencode-classification'
 import { projectDiagnosticLog, projectDiagnosticSession } from './projection'
 
 describe('diagnostic log projection', () => {
+  it('exports only allowlisted OpenCode classification failure details', () => {
+    const event = {
+      scope: 'acp-connection',
+      msg: OPENCODE_CLASSIFICATION_FAILURE_EVENT,
+      data: {
+        stage: 'chunk',
+        reason: 'http-status',
+        endpoint: 'message',
+        attempt: 2,
+        status: 503,
+        messageId: 'provider-message',
+        error: { message: 'metadata response body' }
+      }
+    }
+    expect(projectDiagnosticLog(event).diagnostics).toEqual({
+      stage: 'chunk',
+      reason: 'http-status',
+      endpoint: 'message',
+      attempt: 2,
+      status: 503
+    })
+    expect(
+      projectDiagnosticLog({ ...event, data: { ...event.data, reason: 'raw response' } })
+        .diagnostics
+    ).toBeUndefined()
+  })
+
   it.each(['never-started', 'started-and-reaped', 'termination-unknown'])(
     'preserves the recorded Notebook process state %s',
     (processState) => {

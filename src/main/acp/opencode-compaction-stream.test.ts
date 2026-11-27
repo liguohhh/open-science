@@ -216,7 +216,7 @@ describe('OpenCode 1.x compaction stream', () => {
     lookup.resolve(new Response(null, { status: 404 }))
 
     await rejected
-    expect(fetchImpl).toHaveBeenCalledOnce()
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
   })
 
   it('does not fail a later prompt when an earlier chunk lookup fails', async () => {
@@ -251,7 +251,7 @@ describe('OpenCode 1.x compaction stream', () => {
     const output = await reading
     expect(output[0]).toMatchObject({ id: 1, error: { code: -32603 } })
     expect(output.slice(1)).toEqual([chunk('s', 'new'), nextResponse])
-    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(fetchImpl).toHaveBeenCalledTimes(3)
   })
 
   it('does not fail a later prompt when an earlier terminal lookup fails', async () => {
@@ -264,6 +264,7 @@ describe('OpenCode 1.x compaction stream', () => {
         lookupStarted.resolve()
         return lookup.promise
       })
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
       .mockImplementation(async () => native('s', 'new', false))
     const nextResponse: AnyMessage = { jsonrpc: '2.0', id: 2, result: { stopReason: 'end_turn' } }
     const test = fixture(
@@ -295,7 +296,7 @@ describe('OpenCode 1.x compaction stream', () => {
     ])
     expect(JSON.stringify(output.slice(0, 3))).not.toContain('INTERNAL_PATH_AND_INSTRUCTIONS')
     expect(output.slice(3)).toEqual([chunk('s', 'new'), nextResponse])
-    expect(fetchImpl).toHaveBeenCalledTimes(3)
+    expect(fetchImpl).toHaveBeenCalledTimes(4)
   })
 
   it('rejects overlapping prompts when their output cannot be attributed after a failure', async () => {
@@ -330,7 +331,7 @@ describe('OpenCode 1.x compaction stream', () => {
       { id: 1, error: { code: -32603 } }
     ])
     expect(JSON.stringify(output)).not.toContain('INTERNAL_PATH_AND_INSTRUCTIONS')
-    expect(fetchImpl).toHaveBeenCalledOnce()
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
   })
 
   it('keeps an earlier summary pending until its own prompt terminal arrives', async () => {
@@ -371,7 +372,7 @@ describe('OpenCode 1.x compaction stream', () => {
       'INTERNAL_PATH_AND_INSTRUCTIONS'
     )
     expect((await reader.read()).done).toBe(true)
-    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(fetchImpl).toHaveBeenCalledTimes(3)
   })
 
   it('rejects every possible owner when summary verification fails at a busy sibling terminal', async () => {
@@ -403,7 +404,7 @@ describe('OpenCode 1.x compaction stream', () => {
       { id: 1, error: { code: -32603 } }
     ])
     expect(JSON.stringify(output)).not.toContain('INTERNAL_PATH_AND_INSTRUCTIONS')
-    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(fetchImpl).toHaveBeenCalledTimes(3)
   })
 
   it('verifies another pending summary after one request fails instead of marking it failed', async () => {
@@ -464,7 +465,7 @@ describe('OpenCode 1.x compaction stream', () => {
     expect((await reader.read()).value).toMatchObject({ id: 1, error: { code: -32603 } })
     expect((await reader.read()).value).toEqual(nextResponse)
     expect((await reader.read()).done).toBe(true)
-    expect(fetchImpl).toHaveBeenCalledTimes(4)
+    expect(fetchImpl).toHaveBeenCalledTimes(5)
   })
 
   it.each([
@@ -512,7 +513,9 @@ describe('OpenCode 1.x compaction stream', () => {
         expect((await reader.read()).value).toEqual(response)
         expect((await reader.read()).done).toBe(true)
       }
-      expect(fetchImpl).toHaveBeenCalledTimes(normalChunk ? 3 : 2)
+      expect(fetchImpl).toHaveBeenCalledTimes(
+        2 + Number(normalChunk) + Number(outcome === 'unavailable')
+      )
     }
   )
 
@@ -575,7 +578,7 @@ describe('OpenCode 1.x compaction stream', () => {
     })
     expect((await reader.read()).value).toMatchObject({ id: 2, error: { code: -32603 } })
     expect((await reader.read()).done).toBe(true)
-    expect(fetchImpl).toHaveBeenCalledTimes(4)
+    expect(fetchImpl).toHaveBeenCalledTimes(5)
   })
 
   it('retries a temporary metadata failure without replaying the prompt', async () => {

@@ -1,6 +1,7 @@
 import { DEFAULT_AGENT_FRAMEWORK_ID } from '../../shared/agent-framework-id'
 import { HARNESS_CHECKPOINT_LOCK_METHOD, harnessCheckpointLockSchema } from '../harness-acp/config'
 import { recordCheckpointLock } from './checkpoint-lock-diagnostics'
+import { OPENCODE_CLASSIFICATION_FAILURE_EVENT } from '../diagnostics/opencode-classification'
 import { bindMainAgentConnection, spawnMainAgentProcess } from './main-agent-process-ownership'
 import { observeResourceProcess } from '../resource-diagnostics/recorder'
 import * as acp from '@agentclientprotocol/sdk'
@@ -399,6 +400,7 @@ class AcpAgentConnectionAdapter {
       stream = createOpenCodeCompactionStream(stream, {
         api: backend.opencodeUsageApi,
         captureUserStop: hooks.captureUserStop,
+        reportFailure: (diagnostic) => log.warn(OPENCODE_CLASSIFICATION_FAILURE_EVENT, diagnostic),
         resolveSessionCwd: hooks.filesystem.resolveSessionCwd,
         signal: abort.signal
       })

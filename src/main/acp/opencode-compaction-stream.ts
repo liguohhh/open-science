@@ -1,5 +1,7 @@
 import type { AnyMessage, JsonRpcId, Stream } from '@agentclientprotocol/sdk'
+import { setTimeout as delay } from 'node:timers/promises'
 import type { ResolvedAgentBackend } from '../agent-framework'
+import type { OpenCodeClassificationDiagnostic } from '../diagnostics/opencode-classification'
 import { isRecord } from '../value-guards'
 
 type MessageIdentity = { sessionId: string; messageId: string }
@@ -15,14 +17,22 @@ type TrackedRequest = {
   cancellation?: AbortController
 }
 type PendingSummary = MessageIdentity & { owners: readonly TrackedRequest[] }
+type MetadataEndpoint = NonNullable<OpenCodeClassificationDiagnostic['endpoint']>
+type ClassificationCause = Omit<OpenCodeClassificationDiagnostic, 'stage'> | { reason: 'cancelled' }
+
 const MAX_CACHE_ENTRIES = 256
 const METADATA_LOOKUP_ATTEMPTS = 2
-const RETRYABLE_METADATA_STATUS = new Set([408, 425, 429, 500, 502, 503, 504])
+const METADATA_RETRY_DELAY_MS = 100
+const RETRYABLE_METADATA_STATUS = new Set([404, 408, 425, 429, 500, 502, 503, 504])
 
-const classificationError = (): Error =>
-  new Error(
-    'OpenCode message classification failed. Output was withheld. Check the local OpenCode service and use an OpenCode 1.x version that supplies ACP message IDs.'
-  )
+const CLASSIFICATION_ERROR_MESSAGE =
+  'OpenCode message classification failed. Output was withheld. Check the local OpenCode service and use an OpenCode 1.x version that supplies ACP message IDs.'
+
+class OpenCodeClassificationError extends Error {
+  constructor(readonly detail: ClassificationCause) {
+    super(CLASSIFICATION_ERROR_MESSAGE)
+  }
+}
 
 const lifecycle = (
   identity: MessageIdentity,
@@ -46,6 +56,7 @@ export function createOpenCodeCompactionStream(
   options: {
     api: ResolvedAgentBackend['opencodeUsageApi']
     captureUserStop?: (providerSessionId: string) => (() => boolean) | undefined
+    reportFailure?: (diagnostic: OpenCodeClassificationDiagnostic) => void
     resolveSessionCwd: (sessionId: string) => string
     signal: AbortSignal
     fetchImpl?: typeof fetch
@@ -81,7 +92,24 @@ export function createOpenCodeCompactionStream(
     }
     return true
   }
-  const readMetadata = async (url: URL, sessionId: string): Promise<unknown> => {
+  const reportFailure = (
+    stage: OpenCodeClassificationDiagnostic['stage'],
+    error: OpenCodeClassificationError
+  ): void => {
+    if (signal.aborted || error.detail.reason === 'cancelled') return
+    try {
+      // 仅记录预定义原因和状态，不记录服务地址、消息 ID 或响应内容。
+      options.reportFailure?.({ ...error.detail, stage })
+    } catch {
+      // 诊断写入失败不影响 ACP 请求的收尾。
+    }
+  }
+  const readMetadata = async <T>(
+    url: URL,
+    sessionId: string,
+    endpoint: MetadataEndpoint,
+    decode: (body: unknown) => T | undefined
+  ): Promise<T> => {
     // Stop is written while metadata may be blocking the inbound ACP stream. Interrupt
     // only this prompt's lookup so the native cancellation acknowledgement can drain.
     const requestSignal = AbortSignal.any([
@@ -90,50 +118,78 @@ export function createOpenCodeCompactionStream(
         request.sessionId === sessionId && request.cancellation ? [request.cancellation.signal] : []
       )
     ])
-    if (!options.api || requestSignal.aborted) throw classificationError()
+    if (requestSignal.aborted) throw new OpenCodeClassificationError({ reason: 'cancelled' })
+    if (!options.api) throw new OpenCodeClassificationError({ reason: 'api-unavailable', endpoint })
     for (let attempt = 1; attempt <= METADATA_LOOKUP_ATTEMPTS; attempt++) {
+      if (attempt > 1) {
+        // ACP 内容块到达时，HTTP 查询可能尚不可见。只重读元数据，并允许停止立即打断等待。
+        try {
+          await delay(METADATA_RETRY_DELAY_MS, undefined, { signal: requestSignal })
+        } catch {
+          throw new OpenCodeClassificationError({ reason: 'cancelled' })
+        }
+      }
+      const deadline = AbortSignal.timeout(2_000)
       let response: Response
       try {
         response = await (options.fetchImpl ?? fetch)(url, {
           headers: { authorization: options.api.authorization },
-          signal: AbortSignal.any([requestSignal, AbortSignal.timeout(2_000)])
+          signal: AbortSignal.any([requestSignal, deadline])
         })
       } catch {
-        if (!requestSignal.aborted && attempt < METADATA_LOOKUP_ATTEMPTS) continue
-        throw classificationError()
+        if (requestSignal.aborted) {
+          throw new OpenCodeClassificationError({ reason: 'cancelled' })
+        }
+        if (attempt < METADATA_LOOKUP_ATTEMPTS) continue
+        throw new OpenCodeClassificationError({
+          reason: deadline.aborted ? 'timeout' : 'transport',
+          endpoint,
+          attempt
+        })
       }
       if (!response.ok) {
         void response.body?.cancel().catch(() => undefined)
-        if (
-          !requestSignal.aborted &&
-          attempt < METADATA_LOOKUP_ATTEMPTS &&
-          RETRYABLE_METADATA_STATUS.has(response.status)
-        )
+        if (requestSignal.aborted) throw new OpenCodeClassificationError({ reason: 'cancelled' })
+        if (attempt < METADATA_LOOKUP_ATTEMPTS && RETRYABLE_METADATA_STATUS.has(response.status))
           continue
-        throw classificationError()
+        throw new OpenCodeClassificationError({
+          reason: 'http-status',
+          endpoint,
+          attempt,
+          status: response.status
+        })
       }
+      let body: unknown
       try {
-        const body: unknown = await response.json()
-        if (requestSignal.aborted) throw classificationError()
-        return body
+        body = await response.json()
       } catch (error) {
-        if (
-          !requestSignal.aborted &&
-          attempt < METADATA_LOOKUP_ATTEMPTS &&
-          !(error instanceof SyntaxError)
-        )
-          continue
-        throw classificationError()
+        if (requestSignal.aborted) {
+          throw new OpenCodeClassificationError({ reason: 'cancelled' })
+        }
+        const invalidJson = error instanceof SyntaxError
+        if (attempt < METADATA_LOOKUP_ATTEMPTS && !invalidJson) continue
+        throw new OpenCodeClassificationError({
+          reason: invalidJson ? 'invalid-json' : deadline.aborted ? 'timeout' : 'transport',
+          endpoint,
+          attempt
+        })
       }
+      if (requestSignal.aborted) throw new OpenCodeClassificationError({ reason: 'cancelled' })
+      const metadata = decode(body)
+      if (metadata !== undefined) return metadata
+      if (attempt === METADATA_LOOKUP_ATTEMPTS)
+        throw new OpenCodeClassificationError({ reason: 'part-not-found', endpoint, attempt })
     }
-    throw classificationError()
+    throw new OpenCodeClassificationError({ reason: 'unexpected', endpoint })
   }
   const resolveMessageId = async (identity: MessageIdentity): Promise<MessageIdentity> => {
     try {
       if (!identity.messageId.startsWith('prt_')) return identity
       const cached = partMessages.get(`${identity.sessionId}:${identity.messageId}`)
       if (cached) return { ...identity, messageId: cached }
-      if (!options.api || signal.aborted) throw classificationError()
+      if (signal.aborted) throw new OpenCodeClassificationError({ reason: 'cancelled' })
+      if (!options.api)
+        throw new OpenCodeClassificationError({ reason: 'api-unavailable', endpoint: 'history' })
       const url = new URL(
         `/session/${encodeURIComponent(identity.sessionId)}/message`,
         options.api.baseUrl
@@ -147,36 +203,47 @@ export function createOpenCodeCompactionStream(
           sessionCwds.get(identity.sessionId) ??
           options.resolveSessionCwd(identity.sessionId)
       )
-      const body = await readMetadata(url, identity.sessionId)
-      const messages = Array.isArray(body)
-        ? body
-        : isRecord(body) && Array.isArray(body.data)
-          ? body.data
-          : undefined
-      const match = messages?.find((message) => {
-        if (!isRecord(message) || !isRecord(message.info) || !Array.isArray(message.parts))
-          return false
-        return (
-          message.info.sessionID === identity.sessionId &&
-          message.info.role === 'assistant' &&
-          typeof message.info.id === 'string' &&
-          message.parts.some((part) => isRecord(part) && part.id === identity.messageId)
-        )
+      const messageId = await readMetadata(url, identity.sessionId, 'history', (body) => {
+        const messages = Array.isArray(body) ? body : isRecord(body) ? body.data : undefined
+        if (!Array.isArray(messages))
+          throw new OpenCodeClassificationError({
+            reason: 'invalid-history-metadata',
+            endpoint: 'history'
+          })
+        for (const message of messages) {
+          if (
+            isRecord(message) &&
+            isRecord(message.info) &&
+            message.info.sessionID === identity.sessionId &&
+            message.info.role === 'assistant' &&
+            typeof message.info.id === 'string' &&
+            Array.isArray(message.parts) &&
+            message.parts.some((part) => isRecord(part) && part.id === identity.messageId)
+          ) {
+            if (!message.info.id.startsWith('msg_'))
+              throw new OpenCodeClassificationError({
+                reason: 'invalid-history-metadata',
+                endpoint: 'history'
+              })
+            return message.info.id
+          }
+        }
+        return undefined
       })
-      const messageId = isRecord(match) && isRecord(match.info) ? match.info.id : undefined
-      if (typeof messageId !== 'string' || !messageId.startsWith('msg_'))
-        throw classificationError()
       if (partMessages.size >= MAX_CACHE_ENTRIES)
         partMessages.delete(partMessages.keys().next().value!)
       partMessages.set(`${identity.sessionId}:${identity.messageId}`, messageId)
       return { ...identity, messageId }
-    } catch {
-      throw classificationError()
+    } catch (error) {
+      if (error instanceof OpenCodeClassificationError) throw error
+      throw new OpenCodeClassificationError({ reason: 'unexpected', endpoint: 'history' })
     }
   }
   const classify = async (identity: MessageIdentity): Promise<Classification> => {
     try {
-      if (!options.api || signal.aborted) throw classificationError()
+      if (signal.aborted) throw new OpenCodeClassificationError({ reason: 'cancelled' })
+      if (!options.api)
+        throw new OpenCodeClassificationError({ reason: 'api-unavailable', endpoint: 'message' })
       const url = new URL(
         `/session/${encodeURIComponent(identity.sessionId)}/message/${encodeURIComponent(identity.messageId)}`,
         options.api.baseUrl
@@ -191,25 +258,29 @@ export function createOpenCodeCompactionStream(
           sessionCwds.get(identity.sessionId) ??
           options.resolveSessionCwd(identity.sessionId)
       )
-      const body = await readMetadata(url, identity.sessionId)
-      const info = isRecord(body) ? body.info : undefined
-      if (
-        signal.aborted ||
-        !isRecord(info) ||
-        info.id !== identity.messageId ||
-        info.sessionID !== identity.sessionId ||
-        info.role !== 'assistant' ||
-        (info.summary !== undefined && typeof info.summary !== 'boolean')
-      )
-        throw classificationError()
-      return {
-        summary: info.summary === true,
-        finished: typeof info.finish === 'string' || info.error != null,
-        succeeded: info.finish === 'stop' && info.error == null
-      }
-    } catch {
+      return await readMetadata(url, identity.sessionId, 'message', (body) => {
+        const info = isRecord(body) ? body.info : undefined
+        if (
+          !isRecord(info) ||
+          info.id !== identity.messageId ||
+          info.sessionID !== identity.sessionId ||
+          info.role !== 'assistant' ||
+          (info.summary !== undefined && typeof info.summary !== 'boolean')
+        )
+          throw new OpenCodeClassificationError({
+            reason: 'invalid-message-metadata',
+            endpoint: 'message'
+          })
+        return {
+          summary: info.summary === true,
+          finished: typeof info.finish === 'string' || info.error != null,
+          succeeded: info.finish === 'stop' && info.error == null
+        }
+      })
+    } catch (error) {
       // Native response bodies, paths and transport errors may contain internal context.
-      throw classificationError()
+      if (error instanceof OpenCodeClassificationError) throw error
+      throw new OpenCodeClassificationError({ reason: 'unexpected', endpoint: 'message' })
     }
   }
   const finish = async (
@@ -228,6 +299,8 @@ export function createOpenCodeCompactionStream(
       try {
         info = await classify(identity)
       } catch (error) {
+        if (error instanceof OpenCodeClassificationError)
+          reportFailure('summary-finalization', error)
         // A summary keeps its first owners. Unowned lookup failures remain transport-fatal.
         if (signal.aborted || !failRequests(identity.owners)) throw error
         // One failed probe does not establish the outcome of other pending summaries.
@@ -296,7 +369,7 @@ export function createOpenCodeCompactionStream(
     readable: stream.readable.pipeThrough(
       new TransformStream<AnyMessage, AnyMessage>({
         async transform(message, controller) {
-          if (signal.aborted) throw classificationError()
+          if (signal.aborted) throw new OpenCodeClassificationError({ reason: 'cancelled' })
           if (!('method' in message)) {
             const request = requests.get(message.id)
             if (request?.sessionId && contentRequest(request.method)) {
@@ -336,7 +409,7 @@ export function createOpenCodeCompactionStream(
                 ? {
                     jsonrpc: '2.0',
                     id: message.id,
-                    error: { code: -32603, message: classificationError().message }
+                    error: { code: -32603, message: CLASSIFICATION_ERROR_MESSAGE }
                   }
                 : message
             )
@@ -352,7 +425,11 @@ export function createOpenCodeCompactionStream(
             controller.enqueue(message)
             return
           }
-          if (!isRecord(params) || typeof params.sessionId !== 'string') throw classificationError()
+          if (!isRecord(params) || typeof params.sessionId !== 'string') {
+            const error = new OpenCodeClassificationError({ reason: 'missing-session-id' })
+            reportFailure('chunk', error)
+            throw error
+          }
           // Preserve arrival-time ownership across metadata awaits; later writes cannot claim it.
           const owners = [...requests.values()].filter(
             (request) => request.sessionId === params.sessionId && contentRequest(request.method)
@@ -369,7 +446,7 @@ export function createOpenCodeCompactionStream(
           let normalized: AnyMessage = message
           try {
             if (typeof update.messageId !== 'string' || !update.messageId)
-              throw classificationError()
+              throw new OpenCodeClassificationError({ reason: 'missing-message-id' })
             const incoming = { sessionId: params.sessionId, messageId: update.messageId }
             const identity = await resolveMessageId(incoming)
             normalized =
@@ -401,6 +478,7 @@ export function createOpenCodeCompactionStream(
             }
             if (info.summary) return
           } catch (error) {
+            if (error instanceof OpenCodeClassificationError) reportFailure('chunk', error)
             // Unknown output stays withheld. A metadata failure belongs to its content request;
             // keep consuming control traffic until its native terminal can reject that request.
             if (signal.aborted || !failRequests(owners)) throw error

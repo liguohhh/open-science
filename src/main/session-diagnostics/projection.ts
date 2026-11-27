@@ -4,6 +4,10 @@ import { readHarnessErrorDiagnostics } from '../../shared/failure/contract'
 import { diagnosticText, projectDiagnosticError, type DiagnosticTextOptions } from './detail'
 import { AGENT_FRAMEWORK_ID_VALUES, isAgentFrameworkId } from '../../shared/agent-framework-id'
 import { credentialDiagnosticSchema } from '../credential-identity/diagnostic'
+import {
+  OPENCODE_CLASSIFICATION_FAILURE_EVENT,
+  openCodeClassificationDiagnosticSchema
+} from '../diagnostics/opencode-classification'
 
 /** Diagnostic projections keep only known evidence fields and bounded redacted error text. */
 type ObjectValue = Record<string, unknown>
@@ -411,6 +415,11 @@ export function projectDiagnosticLog(
   ) {
     const event = readSendAttemptEvent(data)
     if (event) result.diagnostics = event
+    return result
+  }
+  if (source.scope === 'acp-connection' && source.msg === OPENCODE_CLASSIFICATION_FAILURE_EVENT) {
+    const event = openCodeClassificationDiagnosticSchema.safeParse(data)
+    if (event.success) result.diagnostics = event.data
     return result
   }
   const diagnostic = fields(data, options)

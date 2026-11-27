@@ -5,18 +5,19 @@ import { expect, it, vi } from 'vitest'
 import { createOpenCodeCompactionStream } from './opencode-compaction-stream'
 
 const metadata = JSON.stringify({ info: { sessionID: 's', id: 'm', role: 'assistant' } })
-const chunk: AnyMessage = {
+const contentChunk = (messageId: string, sessionUpdate = 'agent_message_chunk'): AnyMessage => ({
   jsonrpc: '2.0',
   method: 'session/update',
   params: {
     sessionId: 's',
     update: {
-      sessionUpdate: 'agent_message_chunk',
-      messageId: 'm',
+      sessionUpdate,
+      messageId,
       content: { type: 'text', text: 'classified output' }
     }
   }
-}
+})
+const chunk = contentChunk('m')
 const response = (id: number): AnyMessage => ({
   jsonrpc: '2.0',
   id,
@@ -43,7 +44,8 @@ const withServer = async (
 
 const fixture = (
   baseUrl: string,
-  onHeaders?: () => void
+  onHeaders?: () => void,
+  incoming = chunk
 ): {
   reader: ReadableStreamDefaultReader<AnyMessage>
   prompt: (id: number) => Promise<void>
@@ -86,11 +88,55 @@ const fixture = (
         method: 'session/prompt',
         params: { sessionId: 's', prompt: [] }
       })
-      source.enqueue(chunk)
+      source.enqueue(incoming)
       source.enqueue(response(id))
     }
   }
 }
+
+it('rechecks metadata after a temporary not-found response', async () => {
+  await withServer(
+    (res, attempt) => {
+      if (attempt === 1) res.writeHead(404).end()
+      else res.writeHead(200, { 'content-type': 'application/json' }).end(metadata)
+    },
+    async (url, attempts) => {
+      const test = fixture(url)
+      try {
+        await test.prompt(1)
+        expect((await test.reader.read()).value).toEqual(chunk)
+        expect((await test.reader.read()).value).toEqual(response(1))
+        expect(test.headers).toEqual([404, 200])
+        expect(attempts()).toBe(2)
+      } finally {
+        test.abort.abort()
+      }
+    }
+  )
+})
+
+it('rechecks history when a reasoning part is temporarily absent', async () => {
+  const info = { sessionID: 's', id: 'msg_m', role: 'assistant' }
+  const thought = 'agent_thought_chunk'
+  await withServer(
+    (res, attempt) => {
+      const body =
+        attempt === 1 ? [] : attempt === 2 ? [{ info, parts: [{ id: 'prt_p' }] }] : { info }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body))
+    },
+    async (url, attempts) => {
+      const test = fixture(url, undefined, contentChunk('prt_p', thought))
+      try {
+        await test.prompt(1)
+        expect((await test.reader.read()).value).toEqual(contentChunk('msg_m', thought))
+        expect((await test.reader.read()).value).toEqual(response(1))
+        expect(attempts()).toBe(3)
+      } finally {
+        test.abort.abort()
+      }
+    }
+  )
+})
 
 it('retries a reset after successful headers and delivers the classified response', async () => {
   let interrupted: ServerResponse | undefined

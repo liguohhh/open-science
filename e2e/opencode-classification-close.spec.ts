@@ -103,7 +103,7 @@ for (const mode of [
     expect(requests.every((request) => request.mode === mode && request.infoPresent)).toBe(true)
     const outcome = session.messages.find((message) => message.role === 'user')?.turnOutcome
     if (succeeds) expect(outcome?.kind).toBe('completed')
-    expect(requests).toHaveLength(mode === 'healthy' || mode === 'not-yet-visible' ? 1 : 2)
+    expect(requests).toHaveLength(mode === 'healthy' ? 1 : 2)
     const timeoutMs: number[] = []
     if (mode === 'timeout') {
       for (const attempt of [1, 2]) {
