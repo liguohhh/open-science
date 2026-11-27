@@ -1,7 +1,9 @@
 import type { AnyMessage } from '@agentclientprotocol/sdk'
 import { once } from 'node:events'
-import { createServer, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { setTimeout as delay } from 'node:timers/promises'
 import { expect, it, vi } from 'vitest'
+import type { OpenCodeClassificationDiagnostic } from '../diagnostics/opencode-classification'
 import { createOpenCodeCompactionStream } from './opencode-compaction-stream'
 
 const metadata = JSON.stringify({ info: { sessionID: 's', id: 'm', role: 'assistant' } })
@@ -25,11 +27,11 @@ const response = (id: number): AnyMessage => ({
 })
 
 const withServer = async (
-  handle: (response: ServerResponse, attempt: number) => void,
+  handle: (response: ServerResponse, attempt: number, request: IncomingMessage) => void,
   run: (baseUrl: string, attempts: () => number) => Promise<void>
 ): Promise<void> => {
   let attempts = 0
-  const server = createServer((_request, response) => handle(response, ++attempts))
+  const server = createServer((request, response) => handle(response, ++attempts, request))
   try {
     server.listen(0, '127.0.0.1')
     await once(server, 'listening')
@@ -45,15 +47,17 @@ const withServer = async (
 const fixture = (
   baseUrl: string,
   onHeaders?: () => void,
-  incoming = chunk
+  incoming = [chunk]
 ): {
   reader: ReadableStreamDefaultReader<AnyMessage>
-  prompt: (id: number) => Promise<void>
+  prompt: (id: number, method?: 'session/prompt' | 'session/load') => Promise<void>
   abort: AbortController
   headers: number[]
+  diagnostics: OpenCodeClassificationDiagnostic[]
 } => {
   const abort = new AbortController()
   const headers: number[] = []
+  const diagnostics: OpenCodeClassificationDiagnostic[] = []
   let source!: ReadableStreamDefaultController<AnyMessage>
   const stream = createOpenCodeCompactionStream(
     {
@@ -67,6 +71,7 @@ const fixture = (
     {
       api: { baseUrl, authorization: 'Basic test' },
       resolveSessionCwd: () => '/workspace',
+      reportFailure: (diagnostic) => diagnostics.push(diagnostic),
       signal: abort.signal,
       fetchImpl: async (input, init) => {
         const response = await fetch(input, init)
@@ -81,14 +86,15 @@ const fixture = (
     reader: stream.readable.getReader(),
     abort,
     headers,
-    prompt: async (id) => {
+    diagnostics,
+    prompt: async (id, method = 'session/prompt') => {
       await writer.write({
         jsonrpc: '2.0',
         id,
-        method: 'session/prompt',
+        method,
         params: { sessionId: 's', prompt: [] }
       })
-      source.enqueue(incoming)
+      incoming.forEach((message) => source.enqueue(message))
       source.enqueue(response(id))
     }
   }
@@ -115,22 +121,122 @@ it('rechecks metadata after a temporary not-found response', async () => {
   )
 })
 
-it('rechecks history when a reasoning part is temporarily absent', async () => {
+it('retries the recent window and classifies multiple reasoning parts from one history hit', async () => {
   const info = { sessionID: 's', id: 'msg_m', role: 'assistant' }
+  const parts = [{ id: 'prt_first' }, { id: 'prt_second' }]
   const thought = 'agent_thought_chunk'
+  const urls: URL[] = []
   await withServer(
-    (res, attempt) => {
-      const body =
-        attempt === 1 ? [] : attempt === 2 ? [{ info, parts: [{ id: 'prt_p' }] }] : { info }
+    (res, attempt, request) => {
+      urls.push(new URL(request.url!, 'http://localhost'))
+      const body = attempt <= 2 ? [] : [{ info, parts }]
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body))
     },
-    async (url, attempts) => {
-      const test = fixture(url, undefined, contentChunk('prt_p', thought))
+    async (url) => {
+      const test = fixture(
+        url,
+        undefined,
+        parts.map(({ id }) => contentChunk(id, thought))
+      )
       try {
         await test.prompt(1)
         expect((await test.reader.read()).value).toEqual(contentChunk('msg_m', thought))
+        expect((await test.reader.read()).value).toEqual(contentChunk('msg_m', thought))
         expect((await test.reader.read()).value).toEqual(response(1))
-        expect(attempts()).toBe(3)
+        expect(urls.map((url) => [url.pathname, url.searchParams.get('limit')])).toEqual(
+          Array.from({ length: 3 }, () => ['/session/s/message', '20'])
+        )
+      } finally {
+        test.abort.abort()
+      }
+    }
+  )
+})
+
+it.each(['session/prompt', 'session/load'] as const)(
+  'finds older parts in full history for %s',
+  async (method) => {
+    const limits: Array<string | null> = []
+    const thought = 'agent_thought_chunk'
+    const target = {
+      info: { sessionID: 's', id: 'msg_old', role: 'assistant' },
+      parts: [{ id: 'prt_old' }]
+    }
+    const recent = Array.from({ length: 20 }, (_, index) => ({
+      info: { sessionID: 's', id: `msg_recent${index}`, role: 'assistant' },
+      parts: [{ id: `prt_recent${index}` }]
+    }))
+    await withServer(
+      (res, _attempt, request) => {
+        const url = new URL(request.url!, 'http://localhost')
+        const limit = url.searchParams.get('limit')
+        limits.push(limit)
+        const body = limit ? recent : [target, ...recent]
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body))
+      },
+      async (url) => {
+        const test = fixture(url, undefined, [contentChunk('prt_old', thought)])
+        try {
+          await test.prompt(1, method)
+          expect((await test.reader.read()).value).toEqual(contentChunk('msg_old', thought))
+          expect((await test.reader.read()).value).toEqual(response(1))
+          expect(limits).toEqual(method === 'session/prompt' ? ['20', '20', '20', null] : [null])
+        } finally {
+          test.abort.abort()
+        }
+      }
+    )
+  }
+)
+
+it('accepts a history body that takes longer than the old two-second deadline', async () => {
+  const info = { sessionID: 's', id: 'msg_slow', role: 'assistant' }
+  await withServer(
+    (res) => {
+      res.writeHead(200, { 'content-type': 'application/json' }).flushHeaders()
+      void delay(2_200).then(() => res.end(JSON.stringify([{ info, parts: [{ id: 'prt_slow' }] }])))
+    },
+    async (url, attempts) => {
+      const test = fixture(url, undefined, [contentChunk('prt_slow')])
+      try {
+        await test.prompt(1)
+        expect((await test.reader.read()).value).toEqual(contentChunk('msg_slow'))
+        expect((await test.reader.read()).value).toEqual(response(1))
+        expect(attempts()).toBe(1)
+      } finally {
+        test.abort.abort()
+      }
+    }
+  )
+})
+
+it('reports elapsed time and the full-history count when a part stays absent', async () => {
+  await withServer(
+    (res, _attempt, request) => {
+      const limit = new URL(request.url!, 'http://localhost').searchParams.get('limit')
+      const body = Array.from({ length: limit ? 20 : 580 }, () => ({}))
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body))
+    },
+    async (url, attempts) => {
+      const test = fixture(url, undefined, [contentChunk('prt_missing')])
+      try {
+        await test.prompt(1)
+        expect((await test.reader.read()).value).toMatchObject({
+          id: 1,
+          error: { code: -32603, message: expect.stringContaining('(part-not-found)') }
+        })
+        expect(test.diagnostics).toEqual([
+          {
+            stage: 'chunk',
+            reason: 'part-not-found',
+            endpoint: 'history',
+            attempt: 4,
+            elapsedMs: expect.any(Number),
+            messageCount: 580
+          }
+        ])
+        expect(test.diagnostics[0].elapsedMs).toBeGreaterThanOrEqual(800)
+        expect(attempts()).toBe(4)
       } finally {
         test.abort.abort()
       }
@@ -189,12 +295,12 @@ it('bounds repeated body resets and permits a later prompt on the same stream', 
         const failed = (await test.reader.read()).value
         expect(failed).toMatchObject({ id: 1, error: { code: -32603 } })
         expect(JSON.stringify(failed)).not.toContain('INTERNAL_PATH_AND_INSTRUCTIONS')
-        expect(attempts()).toBe(2)
+        expect(attempts()).toBe(4)
         healthy = true
         await test.prompt(2)
         expect((await test.reader.read()).value).toEqual(chunk)
         expect((await test.reader.read()).value).toEqual(response(2))
-        expect(attempts()).toBe(3)
+        expect(attempts()).toBe(5)
       } finally {
         test.abort.abort()
       }

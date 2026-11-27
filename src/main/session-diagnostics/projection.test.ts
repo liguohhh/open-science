@@ -14,6 +14,7 @@ describe('diagnostic log projection', () => {
         endpoint: 'message',
         attempt: 2,
         status: 503,
+        elapsedMs: 910,
         messageId: 'provider-message',
         error: { message: 'metadata response body' }
       }
@@ -23,7 +24,29 @@ describe('diagnostic log projection', () => {
       reason: 'http-status',
       endpoint: 'message',
       attempt: 2,
-      status: 503
+      status: 503,
+      elapsedMs: 910
+    })
+    expect(
+      projectDiagnosticLog({
+        ...event,
+        data: {
+          stage: 'chunk',
+          reason: 'part-not-found',
+          endpoint: 'history',
+          attempt: 4,
+          messageCount: 580,
+          elapsedMs: 1431,
+          directory: '/private/workspace'
+        }
+      }).diagnostics
+    ).toEqual({
+      stage: 'chunk',
+      reason: 'part-not-found',
+      endpoint: 'history',
+      attempt: 4,
+      messageCount: 580,
+      elapsedMs: 1431
     })
     expect(
       projectDiagnosticLog({ ...event, data: { ...event.data, reason: 'raw response' } })

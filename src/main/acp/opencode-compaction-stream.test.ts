@@ -21,10 +21,14 @@ const nativePart = (
   sessionID: string,
   messageId: string,
   partId: string,
-  summary: boolean
+  summary: boolean,
+  finish?: string
 ): Response =>
   Response.json([
-    { info: { sessionID, id: messageId, role: 'assistant', summary }, parts: [{ id: partId }] }
+    {
+      info: { sessionID, id: messageId, role: 'assistant', summary, finish },
+      parts: [{ id: partId }]
+    }
   ])
 const fixture = (
   messages: AnyMessage[],
@@ -216,7 +220,7 @@ describe('OpenCode 1.x compaction stream', () => {
     lookup.resolve(new Response(null, { status: 404 }))
 
     await rejected
-    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(fetchImpl).toHaveBeenCalledTimes(4)
   })
 
   it('does not fail a later prompt when an earlier chunk lookup fails', async () => {
@@ -251,7 +255,7 @@ describe('OpenCode 1.x compaction stream', () => {
     const output = await reading
     expect(output[0]).toMatchObject({ id: 1, error: { code: -32603 } })
     expect(output.slice(1)).toEqual([chunk('s', 'new'), nextResponse])
-    expect(fetchImpl).toHaveBeenCalledTimes(3)
+    expect(fetchImpl).toHaveBeenCalledTimes(5)
   })
 
   it('does not fail a later prompt when an earlier terminal lookup fails', async () => {
@@ -264,8 +268,11 @@ describe('OpenCode 1.x compaction stream', () => {
         lookupStarted.resolve()
         return lookup.promise
       })
-      .mockResolvedValueOnce(new Response(null, { status: 404 }))
-      .mockImplementation(async () => native('s', 'new', false))
+      .mockImplementation(async (url) =>
+        String(url).includes('/message/summary?')
+          ? new Response(null, { status: 404 })
+          : native('s', 'new', false)
+      )
     const nextResponse: AnyMessage = { jsonrpc: '2.0', id: 2, result: { stopReason: 'end_turn' } }
     const test = fixture(
       [chunk('s', 'summary'), response, chunk('s', 'new'), nextResponse],
@@ -296,7 +303,7 @@ describe('OpenCode 1.x compaction stream', () => {
     ])
     expect(JSON.stringify(output.slice(0, 3))).not.toContain('INTERNAL_PATH_AND_INSTRUCTIONS')
     expect(output.slice(3)).toEqual([chunk('s', 'new'), nextResponse])
-    expect(fetchImpl).toHaveBeenCalledTimes(4)
+    expect(fetchImpl).toHaveBeenCalledTimes(6)
   })
 
   it('rejects overlapping prompts when their output cannot be attributed after a failure', async () => {
@@ -331,7 +338,7 @@ describe('OpenCode 1.x compaction stream', () => {
       { id: 1, error: { code: -32603 } }
     ])
     expect(JSON.stringify(output)).not.toContain('INTERNAL_PATH_AND_INSTRUCTIONS')
-    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(fetchImpl).toHaveBeenCalledTimes(4)
   })
 
   it('keeps an earlier summary pending until its own prompt terminal arrives', async () => {
@@ -372,7 +379,7 @@ describe('OpenCode 1.x compaction stream', () => {
       'INTERNAL_PATH_AND_INSTRUCTIONS'
     )
     expect((await reader.read()).done).toBe(true)
-    expect(fetchImpl).toHaveBeenCalledTimes(3)
+    expect(fetchImpl).toHaveBeenCalledTimes(5)
   })
 
   it('rejects every possible owner when summary verification fails at a busy sibling terminal', async () => {
@@ -404,7 +411,7 @@ describe('OpenCode 1.x compaction stream', () => {
       { id: 1, error: { code: -32603 } }
     ])
     expect(JSON.stringify(output)).not.toContain('INTERNAL_PATH_AND_INSTRUCTIONS')
-    expect(fetchImpl).toHaveBeenCalledTimes(3)
+    expect(fetchImpl).toHaveBeenCalledTimes(5)
   })
 
   it('verifies another pending summary after one request fails instead of marking it failed', async () => {
@@ -465,7 +472,7 @@ describe('OpenCode 1.x compaction stream', () => {
     expect((await reader.read()).value).toMatchObject({ id: 1, error: { code: -32603 } })
     expect((await reader.read()).value).toEqual(nextResponse)
     expect((await reader.read()).done).toBe(true)
-    expect(fetchImpl).toHaveBeenCalledTimes(5)
+    expect(fetchImpl).toHaveBeenCalledTimes(7)
   })
 
   it.each([
@@ -514,7 +521,7 @@ describe('OpenCode 1.x compaction stream', () => {
         expect((await reader.read()).done).toBe(true)
       }
       expect(fetchImpl).toHaveBeenCalledTimes(
-        2 + Number(normalChunk) + Number(outcome === 'unavailable')
+        2 + Number(normalChunk) + 3 * Number(outcome === 'unavailable')
       )
     }
   )
@@ -578,7 +585,7 @@ describe('OpenCode 1.x compaction stream', () => {
     })
     expect((await reader.read()).value).toMatchObject({ id: 2, error: { code: -32603 } })
     expect((await reader.read()).done).toBe(true)
-    expect(fetchImpl).toHaveBeenCalledTimes(5)
+    expect(fetchImpl).toHaveBeenCalledTimes(7)
   })
 
   it('retries a temporary metadata failure without replaying the prompt', async () => {
@@ -630,9 +637,10 @@ describe('OpenCode 1.x compaction stream', () => {
       id: 1,
       error: {
         code: -32603,
-        message: expect.stringContaining('OpenCode message classification failed')
+        message: expect.stringContaining('Local OpenCode metadata is unavailable (http-status)')
       }
     })
+    expect(JSON.stringify(failed.value)).not.toContain('OpenCode 1.x')
     expect(JSON.stringify(failed.value)).not.toContain('PRIVATE_METADATA_FAILURE')
     await writer.write({
       jsonrpc: '2.0',
@@ -693,7 +701,7 @@ describe('OpenCode 1.x compaction stream', () => {
         }
       })
       expect(JSON.stringify(output)).not.toContain('PRIVATE_METADATA_FAILURE')
-      expect(fetchImpl).toHaveBeenCalledTimes(3)
+      expect(fetchImpl).toHaveBeenCalledTimes(5)
     }
   )
 
@@ -718,16 +726,18 @@ describe('OpenCode 1.x compaction stream', () => {
     ])
     expect(JSON.stringify(output)).not.toContain('INTERNAL_PATH_AND_INSTRUCTIONS')
     expect(JSON.stringify(output)).not.toContain('completed')
-    expect(fetchImpl).toHaveBeenCalledTimes(3)
+    expect(fetchImpl).toHaveBeenCalledTimes(5)
   })
 
   it('reclassifies an unfinished summary after its owning request failed', async () => {
     const fetchImpl = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(native('s', 'summary', true))
-      .mockResolvedValueOnce(new Response(null, { status: 503 }))
-      .mockResolvedValueOnce(new Response(null, { status: 503 }))
-      .mockResolvedValueOnce(native('s', 'summary', true, 'stop'))
+      .mockImplementation(async () =>
+        fetchImpl.mock.calls.length <= 5
+          ? new Response(null, { status: 503 })
+          : native('s', 'summary', true, 'stop')
+      )
     const secondResponse: AnyMessage = { jsonrpc: '2.0', id: 2, result: { stopReason: 'end_turn' } }
     const test = fixture(
       [chunk('s', 'summary'), response, chunk('s', 'summary'), secondResponse],
@@ -756,7 +766,7 @@ describe('OpenCode 1.x compaction stream', () => {
     })
     expect((await reader.read()).value).toEqual(secondResponse)
     expect((await reader.read()).done).toBe(true)
-    expect(fetchImpl).toHaveBeenCalledTimes(4)
+    expect(fetchImpl).toHaveBeenCalledTimes(6)
   })
 
   it('rejects invalid metadata without retrying or exposing later output in the same prompt', async () => {
@@ -882,8 +892,7 @@ describe('OpenCode 1.x compaction stream', () => {
   it('resolves reasoning part ids to their parent message before classification', async () => {
     const fetchImpl = vi
       .fn<typeof fetch>()
-      .mockResolvedValueOnce(nativePart('s', 'msg_1', 'prt_1', true))
-      .mockResolvedValueOnce(native('s', 'msg_1', true, 'stop'))
+      .mockResolvedValueOnce(nativePart('s', 'msg_1', 'prt_1', true, 'stop'))
     const test = fixture([chunk('s', 'prt_1', true)], fetchImpl)
 
     const output = await test.read()
@@ -896,20 +905,73 @@ describe('OpenCode 1.x compaction stream', () => {
       }
     ])
     expect(String(fetchImpl.mock.calls[0][0])).toContain('/session/s/message?directory=')
-    expect(String(fetchImpl.mock.calls[1][0])).toContain('/session/s/message/msg_1?directory=')
+    expect(fetchImpl).toHaveBeenCalledOnce()
   })
 
   it('normalizes ordinary part-id chunks before SDK delivery', async () => {
     const fetchImpl = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(nativePart('s', 'msg_1', 'prt_1', false))
-      .mockResolvedValueOnce(native('s', 'msg_1', false))
     const test = fixture([chunk('s', 'prt_1', true)], fetchImpl)
 
     const output = await test.read()
 
     expect(output).toMatchObject([
       { params: { update: { messageId: 'msg_1', sessionUpdate: 'agent_thought_chunk' } } }
+    ])
+  })
+
+  it('classifies a pending summary from history and verifies it at the prompt terminal', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(nativePart('s', 'msg_summary', 'prt_summary', true))
+      .mockResolvedValueOnce(native('s', 'msg_summary', true, 'stop'))
+    const test = fixture([chunk('s', 'prt_summary', true), response], fetchImpl)
+    await test.stream.writable.getWriter().write({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'session/prompt',
+      params: { sessionId: 's', prompt: [] }
+    })
+
+    expect(await test.read()).toMatchObject([
+      { params: { update: { _meta: { 'opencode/compaction': { status: 'started' } } } } },
+      { params: { update: { _meta: { 'opencode/compaction': { status: 'completed' } } } } },
+      response
+    ])
+    expect(fetchImpl.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
+      '/session/s/message',
+      '/session/s/message/msg_summary'
+    ])
+  })
+
+  it('uses indexed recent parts and checks incomplete history metadata at the message endpoint', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json([
+          {
+            info: { sessionID: 's', id: 'msg_first', role: 'assistant', summary: 'unknown' },
+            parts: [{ id: 'prt_first' }]
+          },
+          {
+            info: { sessionID: 's', id: 'msg_recent', role: 'assistant' },
+            parts: [{ id: 'prt_recent' }]
+          }
+        ])
+      )
+      .mockResolvedValueOnce(native('s', 'msg_first', false))
+      .mockResolvedValueOnce(native('s', 'msg_recent', false))
+    const test = fixture([chunk('s', 'prt_first', true), chunk('s', 'prt_recent', true)], fetchImpl)
+
+    expect(await test.read()).toEqual([
+      chunk('s', 'msg_first', true),
+      chunk('s', 'msg_recent', true)
+    ])
+    expect(fetchImpl.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
+      '/session/s/message',
+      '/session/s/message/msg_first',
+      '/session/s/message/msg_recent'
     ])
   })
 
@@ -952,7 +1014,11 @@ describe('OpenCode 1.x compaction stream', () => {
             : native('s', 'other', false)
       )
       const test = fixture([chunk('s', failure === 'missing-id' ? undefined : 'm')], fetchImpl)
-      await expect(test.read()).rejects.toThrow('OpenCode message classification failed')
+      await expect(test.read()).rejects.toThrow(
+        failure === 'missing-id'
+          ? 'The ACP update is missing a message ID. Check that the OpenCode 1.x version'
+          : 'Local OpenCode metadata is unavailable'
+      )
     }
   )
 })

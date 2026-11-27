@@ -119,7 +119,7 @@ it('drains an acknowledged cancellation before the real runtime deadline and reu
       (error: unknown) => ({ error })
     )
     const firstId = await promptRequestId(0)
-    source.enqueue(chunk('slow', 'Unclassified private output'))
+    source.enqueue(chunk('prt_slow', 'Unclassified private output'))
     await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledOnce())
 
     await interactions.cancelPrompt({

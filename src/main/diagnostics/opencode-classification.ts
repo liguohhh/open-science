@@ -19,7 +19,9 @@ export const openCodeClassificationDiagnosticSchema = z.object({
   ]),
   endpoint: z.enum(['history', 'message']).optional(),
   attempt: z.number().int().positive().optional(),
-  status: z.number().int().min(100).max(599).optional()
+  status: z.number().int().min(100).max(599).optional(),
+  elapsedMs: z.number().int().nonnegative().optional(),
+  messageCount: z.number().int().nonnegative().optional()
 })
 
 export type OpenCodeClassificationDiagnostic = z.infer<

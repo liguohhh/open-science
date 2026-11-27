@@ -71,7 +71,8 @@ export const fetchOpenCodeUsageSnapshot = async (
     if (api.version !== 2) url.searchParams.set('directory', cwd)
     const response = await fetchImpl(url, {
       headers: { authorization: api.authorization },
-      signal: AbortSignal.timeout(2_000)
+      // 1.x 返回全量历史，长会话需要为传输和读取响应体留出时间。
+      signal: AbortSignal.timeout(api.version === 2 ? 2_000 : 5_000)
     })
     if (!response.ok) return undefined
 
